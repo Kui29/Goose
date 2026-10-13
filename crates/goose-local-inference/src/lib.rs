@@ -769,6 +769,7 @@ impl Provider for LocalInferenceProvider {
         let model_name = model_config.model_name.clone();
         // Read here: the task-local does not follow the spawn below.
         let replaces_history = goose_provider_types::request_context::replaces_history();
+        let session_id = goose_provider_types::request_context::session();
         let temperature = model_config.temperature;
         let max_tokens = model_config.max_tokens;
         let context_limit = model_context_limit;
@@ -964,6 +965,7 @@ impl Provider for LocalInferenceProvider {
                     tx: &tx,
                     log: &mut log,
                     replaces_history,
+                    session_id,
                 };
 
                 let result = backend.generate(loaded, request);

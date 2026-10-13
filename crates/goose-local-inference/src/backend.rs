@@ -31,6 +31,9 @@ pub(super) struct LocalGenerationRequest<'a> {
     /// The answer replaces the history of the conversation it was asked about, as a compaction's
     /// summary does (see `request_context::replacing_history`).
     pub replaces_history: bool,
+    /// The conversation (goose session) the call is made for, when the caller said
+    /// (see `request_context::for_session`).
+    pub session_id: Option<String>,
 }
 
 pub(super) trait LocalInferenceBackend: Send + Sync {

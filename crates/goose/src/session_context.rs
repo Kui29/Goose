@@ -13,7 +13,14 @@ pub async fn with_session_id<F>(session_id: Option<String>, f: F) -> F::Output
 where
     F: std::future::Future,
 {
-    SESSION_ID.scope(session_id, f).await
+    // Providers cannot see this crate's task-local; they read the session from request_context.
+    let for_provider = session_id.clone();
+    SESSION_ID
+        .scope(
+            session_id,
+            goose_providers::request_context::for_session(for_provider, f),
+        )
+        .await
 }
 
 pub fn current_session_id() -> Option<String> {
@@ -60,6 +67,18 @@ mod tests {
             assert_eq!(current_session_id(), Some("test-session-123".to_string()));
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn test_session_id_reaches_providers() {
+        with_session_id(Some("test-session-123".to_string()), async {
+            assert_eq!(
+                goose_providers::request_context::session(),
+                Some("test-session-123".to_string())
+            );
+        })
+        .await;
+        assert_eq!(goose_providers::request_context::session(), None);
     }
 
     #[tokio::test]
