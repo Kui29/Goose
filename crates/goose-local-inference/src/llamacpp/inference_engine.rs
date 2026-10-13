@@ -13,6 +13,7 @@ use llama_cpp_2::mtmd::{
 use llama_cpp_2::openai::OpenAIChatTemplateParams;
 use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::token::LlamaToken;
+use llama_cpp_2::{LlamaStateSeqFlags, SeqState};
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
@@ -22,6 +23,52 @@ use super::LlamaCppBackend;
 /// Shortest shared prompt prefix worth a partial KV cache removal. Below this
 /// the bookkeeping costs more than the decode it saves.
 const REUSE_MIN_TOKENS: usize = 256;
+
+/// Sliding-window checkpoints kept per retained context, newest last. Each is
+/// the window layers' cells, 16 MiB for Gemma 4 E4B at q8_0 and 768 cells.
+const WINDOW_CHECKPOINTS: usize = 4;
+
+/// How far behind the end of a prefill window checkpoints reach, one at each
+/// batch boundary from the last one at or before the start of the span. A
+/// turn's prompt usually diverges from the cache within the last turn: the
+/// reply as re-rendered, the new message and its context. With the Orin's batch
+/// of 512 that is at most three, and the checkpoint at the end makes four.
+const WINDOW_CHECKPOINT_SPAN: usize = 1024;
+
+/// The sliding-window layers' cells with the cache holding positions `[0, pos)`.
+///
+/// A windowed cache keeps only the last `n_swa` positions plus a ubatch of
+/// slack in those layers, so it can resume only a short way behind its end; a
+/// checkpoint is how a deeper rewind still resumes near where it lands.
+struct WindowCheckpoint {
+    pos: usize,
+    /// Fingerprint of the tokens at `[0, pos)`. A checkpoint is restored only
+    /// under a prompt with the same prefix, whatever rewound the cache since.
+    prefix: u64,
+    state: SeqState,
+}
+
+/// FNV-1a over token ids.
+fn token_fingerprint(tokens: &[LlamaToken]) -> u64 {
+    tokens.iter().fold(0xcbf2_9ce4_8422_2325, |hash, token| {
+        token.0.to_le_bytes().iter().fold(hash, |h, byte| {
+            (h ^ u64::from(*byte)).wrapping_mul(0x100_0000_01b3)
+        })
+    })
+}
+
+/// The model's attention window for its sliding-window layers; 0 when it has
+/// none, as the GGUF says (`<arch>.attention.sliding_window`).
+fn sliding_window(model: &LlamaModel) -> usize {
+    let Ok(arch) = model.meta_val_str("general.architecture") else {
+        return 0;
+    };
+    model
+        .meta_val_str(&format!("{arch}.attention.sliding_window"))
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(0)
+}
 
 pub(super) struct GenerationContext<'a> {
     pub model: &'a Arc<LlamaModel>,
@@ -264,6 +311,9 @@ pub(super) struct SessionKv {
     /// The last prefill into this cache was one-shot work, so nothing will
     /// resume from it and it protects nothing (see `prefill_plan`).
     one_shot: bool,
+    /// The model's sliding window, 0 for a model without one.
+    n_swa: usize,
+    checkpoints: Vec<WindowCheckpoint>,
     _model: Arc<LlamaModel>,
 }
 
@@ -302,12 +352,15 @@ impl SessionKv {
 
         let ctx = SessionCtx::Plain(ctx);
 
+        let n_swa = sliding_window(&model);
         Ok(Self {
             ctx,
             head: None,
             tokens: Vec::new(),
             n_ctx,
             one_shot: false,
+            n_swa,
+            checkpoints: Vec::new(),
             _model: model,
         })
     }
@@ -333,6 +386,70 @@ impl SessionKv {
     /// Every position the cache is known to hold, reusable or not.
     fn occupied(&self) -> usize {
         self.media_pos() + self.tokens.len()
+    }
+
+    /// Saves the window layers' cells while the cache holds exactly `tokens`.
+    /// Text-only caches: behind a media head, positions are not token indices.
+    fn checkpoint_window(&mut self, tokens: &[LlamaToken]) {
+        if self.n_swa == 0 || self.head.is_some() {
+            return;
+        }
+        let pos = tokens.len();
+        if self.checkpoints.last().is_some_and(|c| c.pos == pos) {
+            return;
+        }
+        match self
+            .ctx
+            .ctx()
+            .state_seq_get(0, LlamaStateSeqFlags::PARTIAL_ONLY)
+        {
+            Ok(state) => {
+                self.checkpoints.retain(|c| c.pos < pos);
+                self.checkpoints.push(WindowCheckpoint {
+                    pos,
+                    prefix: token_fingerprint(tokens),
+                    state,
+                });
+                if self.checkpoints.len() > WINDOW_CHECKPOINTS {
+                    self.checkpoints.remove(0);
+                }
+            }
+            Err(error) => tracing::debug!(%error, pos, "window checkpoint not taken"),
+        }
+    }
+
+    /// Where a resume at `resume_pos` under `prompt` can start.
+    ///
+    /// A full-size cache resumes anywhere. A windowed one resumes in place only
+    /// while its window layers still hold the `n_swa` positions behind
+    /// `resume_pos`; past that, the newest checkpoint at or before it with the
+    /// same token prefix puts those cells back, and decoding starts there.
+    /// `None`: nothing to resume from.
+    fn window_resume(&mut self, prompt: &[LlamaToken], resume_pos: usize) -> Option<usize> {
+        if self.n_swa == 0 {
+            return Some(resume_pos);
+        }
+        let pos_min = self.ctx.ctx().kv_cache_seq_pos_min(0);
+        if pos_min >= 0 && pos_min as usize <= resume_pos.saturating_sub(self.n_swa) {
+            return Some(resume_pos);
+        }
+        if self.head.is_some() {
+            return None;
+        }
+        let found = self.checkpoints.iter().rposition(|c| {
+            c.pos <= resume_pos
+                && c.pos <= prompt.len()
+                && c.prefix == token_fingerprint(&prompt[..c.pos])
+        })?;
+        let checkpoint = &self.checkpoints[found];
+        match self.ctx.ctx_mut().state_seq_set(&checkpoint.state, 0) {
+            Ok(()) => Some(checkpoint.pos),
+            Err(error) => {
+                tracing::warn!(%error, pos = checkpoint.pos, "window checkpoint did not restore");
+                self.checkpoints.clear();
+                None
+            }
+        }
     }
 }
 
@@ -726,24 +843,23 @@ pub(super) fn effective_context_size(
     limit
 }
 
-/// LOAD-BEARING FOR KV REUSE: every partial-resume path in this file depends on
-/// `swa_full` being true, so it is pinned here rather than inherited.
+/// LOAD-BEARING FOR KV REUSE: contexts keep a windowed cache (`swa_full =
+/// false`), and every partial resume goes through [`SessionKv::window_resume`].
 ///
-/// A sliding-window model (Gemma among them) normally keeps only a window of KV
-/// per SWA layer, so positions behind `seq_pos_max - window` have already been
-/// evicted. Resuming a decode at such a position would attend to KV that is no
-/// longer there and quietly produce different output — no error, just a worse
-/// answer. `swa_full = true` makes llama.cpp allocate the full-size SWA cache
-/// instead, which is what makes `reuse_prefix` (and the multimodal head resume
-/// built on it) sound. The text-path prefix reuse has the same dependency.
+/// A sliding-window model (Gemma among them) needs, to decode at a position,
+/// the `n_swa` positions behind it in each sliding-window layer. A windowed
+/// cache keeps only the last `n_swa` positions plus a ubatch there, so a resume
+/// further back than that would attend to KV that is no longer there and
+/// quietly produce different output -- no error, just a worse answer.
+/// `window_resume` resumes in place only when the window behind the resume
+/// position is still held, restores a window checkpoint (with the same token
+/// prefix) otherwise, and refuses when there is none. Every resume path must
+/// keep going through it.
 ///
-/// The pin costs nothing today: it is also the vendored default
-/// (`llama_context_default_params()` in `llama.cpp/src/llama-context.cpp`, and
-/// llama-cpp-2 0.1.146's own `swa_full()` doctest asserts it). Stating it in
-/// code is what stops a future goose/llama.cpp sync from flipping that default
-/// and silently un-sounding every resume path. IF THIS LINE IS EVER REMOVED,
-/// partial resume must go with it: `prefill_plan` must stop returning
-/// `ReusePrefix` and `reuse_media_head` must stop resuming behind a head.
+/// Why not the full-size window cache: on a Jetson Orin, Gemma 4 E4B at 16K
+/// context kept 476 MiB of KV with it and 152 MiB without (q8_0), and decoded
+/// 8% slower at 4,400 tokens of context, its sliding-window layers attending
+/// over every cached position rather than the last 512.
 pub(super) fn build_context_params(
     ctx_size: u32,
     settings: &crate::local_model_registry::ModelSettings,
@@ -753,7 +869,7 @@ pub(super) fn build_context_params(
     // of logits per ubatch token for Gemma: 128 MiB at n_ubatch 128, 512 MiB at 512.
     let mut params = LlamaContextParams::default()
         .with_n_ctx(NonZeroU32::new(ctx_size))
-        .with_swa_full(true)
+        .with_swa_full(false)
         .with_n_outputs_max(1);
 
     if let Some(n_batch) = settings.n_batch {
@@ -953,6 +1069,33 @@ fn decode_tokens(
     Ok(())
 }
 
+/// Decode `prompt[from..]` at positions `from..` into a text-only cache,
+/// checkpointing the window layers before each batch that ends inside the last
+/// [`WINDOW_CHECKPOINT_SPAN`] tokens, so a later rewind into this stretch
+/// resumes near where it lands. Behind a media head, or for a model without a
+/// sliding window, this is [`decode_tokens`].
+fn decode_checkpointed(
+    kv: &mut SessionKv,
+    prompt: &[LlamaToken],
+    from: usize,
+) -> Result<(), ProviderError> {
+    if kv.n_swa == 0 || kv.head.is_some() {
+        return decode_tokens(kv.ctx.ctx_mut(), &prompt[from..], from);
+    }
+    let n_batch = (kv.ctx.ctx().n_batch() as usize).max(1);
+    let span_start = prompt.len().saturating_sub(WINDOW_CHECKPOINT_SPAN);
+    let mut pos = from;
+    while pos < prompt.len() {
+        let end = (pos + n_batch).min(prompt.len());
+        if pos > from && end > span_start {
+            kv.checkpoint_window(&prompt[..pos]);
+        }
+        decode_tokens(kv.ctx.ctx_mut(), &prompt[pos..end], pos)?;
+        pos = end;
+    }
+    Ok(())
+}
+
 /// Why a partial KV cache reuse could not be completed.
 enum PrefixReuseError {
     /// llama.cpp declined the partial removal; the cache is untouched.
@@ -1001,13 +1144,17 @@ fn kept_prefix_tokens(
 /// of `prompt` there. `prompt` starts at the cache's `media_pos`, so the tokens
 /// it keeps are those before `resume_pos - media_pos`.
 ///
-/// Sound only while contexts are built with `swa_full = true`; see
-/// [`build_context_params`].
+/// With a windowed cache the decode may start earlier than `resume_pos`, at a
+/// window checkpoint (see [`SessionKv::window_resume`]); returns the position
+/// it started at.
 fn reuse_prefix(
     kv: &mut SessionKv,
     prompt: &[LlamaToken],
     resume_pos: usize,
-) -> Result<(), PrefixReuseError> {
+) -> Result<usize, PrefixReuseError> {
+    let resume_pos = kv
+        .window_resume(prompt, resume_pos)
+        .ok_or(PrefixReuseError::Refused)?;
     let kept = kept_prefix_tokens(resume_pos, kv.media_pos(), prompt.len(), kv.tokens.len())
         .ok_or(PrefixReuseError::Refused)?;
     let p0 = u32::try_from(resume_pos).map_err(|_| PrefixReuseError::Refused)?;
@@ -1015,12 +1162,17 @@ fn reuse_prefix(
         Ok(true) => {}
         Ok(false) | Err(_) => return Err(PrefixReuseError::Refused),
     }
+    kv.checkpoints.retain(|c| c.pos <= resume_pos);
 
     kv.tokens.truncate(kept);
-    decode_tokens(kv.ctx.ctx_mut(), &prompt[kept..], resume_pos)
-        .map_err(PrefixReuseError::Poisoned)?;
+    if kv.head.is_some() {
+        decode_tokens(kv.ctx.ctx_mut(), &prompt[kept..], resume_pos)
+    } else {
+        decode_checkpointed(kv, prompt, kept)
+    }
+    .map_err(PrefixReuseError::Poisoned)?;
     kv.tokens.extend_from_slice(&prompt[kept..]);
-    Ok(())
+    Ok(resume_pos)
 }
 
 /// Trim a retained cache to its first `keep` token positions.
@@ -1037,9 +1189,41 @@ fn trim_to_prefix(kv: &mut SessionKv, keep: usize) -> Result<(), ()> {
     match kv.ctx.ctx_mut().clear_kv_cache_seq(Some(0), Some(p0), None) {
         Ok(true) => {
             kv.tokens.truncate(keep);
+            kv.checkpoints.retain(|c| c.pos <= keep);
             Ok(())
         }
         Ok(false) | Err(_) => Err(()),
+    }
+}
+
+/// The prompt prefilled on top of the preamble snapshot, when one matches.
+// Eight arguments: the session, the snapshot slot, the model and backend that
+// own them, the settings, the prompt and both windows.
+#[allow(clippy::too_many_arguments)]
+fn restore_preamble(
+    session: &mut Option<SessionKv>,
+    snapshot: &mut Option<super::prompt_snapshot::SnapshotSlot>,
+    model: &Arc<LlamaModel>,
+    backend: &LlamaCppBackend,
+    settings: &ModelSettings,
+    prompt: &[LlamaToken],
+    n_ctx: u32,
+    effective_ctx: usize,
+) -> Option<PrefilledPrompt> {
+    let slot = snapshot.as_mut()?;
+    match seed_from_snapshot(session, model, backend, settings, slot, prompt, n_ctx) {
+        Ok(Some(restored)) => Some(PrefilledPrompt {
+            reused_prefix_tokens: restored,
+            transient: None,
+            effective_ctx,
+        }),
+        // No usable file. `session` now holds a fresh empty context that
+        // `full_prefill` decodes into rather than reallocating.
+        Ok(None) => None,
+        Err(e) => {
+            tracing::debug!(error = %e, "snapshot restore failed; prefilling normally");
+            None
+        }
     }
 }
 
@@ -1074,7 +1258,7 @@ fn seed_from_snapshot(
     };
 
     kv.tokens.extend_from_slice(&prompt[..restored]);
-    match decode_tokens(kv.ctx.ctx_mut(), &prompt[restored..], restored) {
+    match decode_checkpointed(&mut kv, prompt, restored) {
         Ok(()) => {
             kv.tokens.extend_from_slice(&prompt[restored..]);
             *session = Some(kv);
@@ -1130,8 +1314,9 @@ fn full_prefill(
         .expect("session was just populated or already matched n_ctx");
     kv.head = None;
     kv.tokens.clear();
+    kv.checkpoints.clear();
     kv.ctx.ctx_mut().clear_kv_cache();
-    match decode_tokens(kv.ctx.ctx_mut(), prompt, 0) {
+    match decode_checkpointed(kv, prompt, 0) {
         Ok(()) => {
             kv.tokens.extend_from_slice(prompt);
             Ok(())
@@ -1201,13 +1386,33 @@ fn write_snapshot_if_due(
     if keep >= kv.tokens.len() || common_prefix_len(&kv.tokens, prompt) < keep {
         return;
     }
-    if trim_to_prefix(kv, keep).is_err() {
+    // A windowed cache holds the window behind `keep` only near its end; a
+    // checkpoint at or before `keep` puts it back, and the stretch from there
+    // to `keep` is decoded again before the write.
+    let Some(at) = kv.window_resume(prompt, keep) else {
         return;
+    };
+    if trim_to_prefix(kv, at).is_err() {
+        return;
+    }
+    if at < keep {
+        if let Err(e) = decode_tokens(kv.ctx.ctx_mut(), &prompt[at..keep], at) {
+            tracing::warn!(
+                target: "giap::kv",
+                event = "discarded",
+                reason = "decoding up to the preamble failed",
+                error = %e,
+                "kv snapshot not written; rebuilding the context"
+            );
+            *session = None;
+            return;
+        }
+        kv.tokens.extend_from_slice(&prompt[at..keep]);
     }
     slot.write(kv.ctx.ctx(), &kv.tokens);
 
     // Put the tail back: the turn still has to generate from the whole prompt.
-    match decode_tokens(kv.ctx.ctx_mut(), &prompt[keep..], keep) {
+    match decode_checkpointed(kv, prompt, keep) {
         Ok(()) => kv.tokens.extend_from_slice(&prompt[keep..]),
         Err(e) => {
             tracing::warn!(
@@ -1281,22 +1486,17 @@ fn prefill_prompt(
         plan,
         PrefillPlan::CreateContext | PrefillPlan::FullPrefillInPlace
     ) {
-        if let Some(slot) = snapshot.as_mut() {
-            match seed_from_snapshot(session, model, backend, settings, slot, prompt, n_ctx) {
-                Ok(Some(restored)) => {
-                    return Ok(PrefilledPrompt {
-                        reused_prefix_tokens: restored,
-                        transient: None,
-                        effective_ctx,
-                    })
-                }
-                // No usable file. `session` now holds a fresh empty context that
-                // `full_prefill` below will decode into rather than reallocate.
-                Ok(None) => {}
-                Err(e) => {
-                    tracing::debug!(error = %e, "snapshot restore failed; prefilling normally");
-                }
-            }
+        if let Some(prefilled) = restore_preamble(
+            session,
+            snapshot,
+            model,
+            backend,
+            settings,
+            prompt,
+            n_ctx,
+            effective_ctx,
+        ) {
+            return Ok(prefilled);
         }
     }
 
@@ -1307,11 +1507,11 @@ fn prefill_prompt(
                 .expect("ReusePrefix is only produced when a session is retained");
 
             match reuse_prefix(kv, prompt, resume) {
-                Ok(()) => {
+                Ok(resumed) => {
                     // Warm by definition: this turn reused a prefix.
                     write_snapshot_if_due(session, snapshot, prompt, false);
                     return Ok(PrefilledPrompt {
-                        reused_prefix_tokens: resume,
+                        reused_prefix_tokens: resumed,
                         transient: None,
                         effective_ctx,
                     });
@@ -1319,8 +1519,21 @@ fn prefill_prompt(
                 Err(PrefixReuseError::Refused) => {
                     tracing::debug!(
                         resume,
-                        "llama.cpp declined partial KV removal; prefilling the whole prompt"
+                        "the cache cannot resume there; prefilling the whole prompt"
                     );
+                    // A resume the cache could not serve is a cold start too.
+                    if let Some(prefilled) = restore_preamble(
+                        session,
+                        snapshot,
+                        model,
+                        backend,
+                        settings,
+                        prompt,
+                        n_ctx,
+                        effective_ctx,
+                    ) {
+                        return Ok(prefilled);
+                    }
                 }
                 Err(PrefixReuseError::Poisoned(e)) => {
                     tracing::warn!(error = %e, "suffix decode failed; rebuilding the generation context");
@@ -1531,7 +1744,7 @@ fn reuse_media_head(
     };
 
     match reuse_prefix(kv, &split.tail, resume) {
-        Ok(()) => Some(resume),
+        Ok(resumed) => Some(resumed),
         Err(PrefixReuseError::Refused) => {
             tracing::debug!(
                 resume,
@@ -1923,6 +2136,10 @@ pub(super) fn prepare_generation(
             if let Some(kv) = ctx.session.as_mut() {
                 kv.session_ctx_mut().ctx_mut().synchronize();
                 kv.one_shot = ctx.one_shot;
+                // A rewind into this prompt's reply resumes at its end.
+                let tokens = std::mem::take(&mut kv.tokens);
+                kv.checkpoint_window(&tokens);
+                kv.tokens = tokens;
             }
         }
     }
@@ -2189,6 +2406,115 @@ pub(super) mod tests {
         assert_eq!(common_prefix_len(&tokens([9]), &tokens([1, 2])), 0);
         assert_eq!(common_prefix_len(&[], &tokens([1, 2])), 0);
         assert_eq!(common_prefix_len(&tokens([1, 2]), &[]), 0);
+    }
+
+    /// A windowed cache keeps only the last few hundred positions in its
+    /// sliding-window layers, so a resume further back must come from a window
+    /// checkpoint, and must then answer like a cache decoded from scratch.
+    /// Refusing is the only other right answer. Gemma 4 E2B, the Orin's batch
+    /// sizes; `#[ignore]` because it needs the GGUF.
+    #[test]
+    #[ignore = "requires a real GGUF on disk; run with --ignored"]
+    fn a_resume_behind_the_window_answers_like_a_full_prefill() {
+        use llama_cpp_2::model::params::LlamaModelParams;
+
+        let Some(src) = live_model_path() else {
+            eprintln!("skipping: no local GGUF found");
+            return;
+        };
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let model_path = tmp.path().join("model.gguf");
+        std::fs::hard_link(&src, &model_path).expect("hard link the model, never symlink it");
+        let backend = shared_backend();
+        let model = Arc::new(
+            LlamaModel::load_from_file(
+                backend.llama_backend(),
+                &model_path,
+                &LlamaModelParams::default(),
+            )
+            .expect("load model"),
+        );
+        assert!(
+            sliding_window(&model) > 0,
+            "the test needs a sliding-window model"
+        );
+        let settings = ModelSettings {
+            n_batch: Some(512),
+            n_ubatch: Some(256),
+            ..Default::default()
+        };
+        let n_ctx: u32 = 4096;
+        let text = |s: &str, bos: AddBos| model.str_to_token(s, bos).expect("tokenize");
+        let shared = text(
+            &"The pond keeps its own notes about the household. ".repeat(160),
+            AddBos::Always,
+        );
+        let then_a = text(
+            &" Kitchen sensors saw the fridge open at seven. ".repeat(110),
+            AddBos::Never,
+        );
+        let then_b = text(" In one word, the weather today is", AddBos::Never);
+        let first: Vec<LlamaToken> = shared.iter().chain(&then_a).copied().collect();
+        let second: Vec<LlamaToken> = shared.iter().chain(&then_b).copied().collect();
+        let last = second.len() - 1;
+
+        // The cache as a turn leaves it: the first prompt, checkpointed.
+        let mut kv = SessionKv::create(&model, backend, n_ctx, &settings).expect("ctx");
+        decode_checkpointed(&mut kv, &first, 0).expect("prefill the first prompt");
+        kv.tokens.extend_from_slice(&first);
+        kv.checkpoint_window(&first);
+        let pos_min = kv.ctx.ctx().kv_cache_seq_pos_min(0);
+        assert!(
+            pos_min as usize > shared.len().saturating_sub(kv.n_swa),
+            "the window no longer covers the divergence ({pos_min}), so this must need a checkpoint"
+        );
+
+        let Ok(resumed) = reuse_prefix(&mut kv, &second[..last], shared.len()) else {
+            panic!("the resume was refused although a checkpoint covers it");
+        };
+        assert!(
+            resumed < shared.len(),
+            "resumed at a checkpoint before the divergence"
+        );
+        decode_tokens(kv.ctx.ctx_mut(), &second[last..], last).expect("decode final token");
+        let windowed = kv.ctx.ctx_mut().get_logits_ith(0).to_vec();
+        eprintln!(
+            "diverged at {}, resumed from a checkpoint at {resumed}, cache end was {}",
+            shared.len(),
+            first.len()
+        );
+
+        let fresh = {
+            let mut kv = SessionKv::create(&model, backend, n_ctx, &settings).expect("ctx");
+            decode_tokens(kv.ctx.ctx_mut(), &second[..last], 0).expect("full prefill");
+            decode_tokens(kv.ctx.ctx_mut(), &second[last..], last).expect("decode final token");
+            kv.ctx.ctx_mut().get_logits_ith(0).to_vec()
+        };
+        let top5 = |v: &[f32]| {
+            let mut idx: Vec<usize> = (0..v.len()).collect();
+            idx.sort_by(|a, b| {
+                v[*b]
+                    .partial_cmp(&v[*a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            idx.truncate(5);
+            idx
+        };
+        assert_eq!(
+            top5(&windowed),
+            top5(&fresh),
+            "a resume behind the window predicts differently from a full prefill"
+        );
+
+        // Without the checkpoint the same resume must be refused, never served.
+        let mut bare = SessionKv::create(&model, backend, n_ctx, &settings).expect("ctx");
+        decode_checkpointed(&mut bare, &first, 0).expect("prefill the first prompt");
+        bare.tokens.extend_from_slice(&first);
+        bare.checkpoints.clear();
+        assert!(matches!(
+            reuse_prefix(&mut bare, &second[..last], shared.len()),
+            Err(PrefixReuseError::Refused)
+        ));
     }
 
     /// The snapshot is only worth anything if a restored cache answers
