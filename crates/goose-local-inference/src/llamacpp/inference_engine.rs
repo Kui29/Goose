@@ -44,6 +44,9 @@ pub(super) struct GenerationContext<'a> {
     /// Cold-load time for this request's model, when the load happened in this
     /// request. None when the model was already resident.
     pub model_load_ms: Option<u64>,
+    /// The request carries no tools: one-shot work (a compaction's summary,
+    /// memory extraction, a title) rather than a turn of a chat.
+    pub one_shot: bool,
 }
 
 pub(super) struct LoadedModel {
@@ -258,6 +261,9 @@ pub(super) struct SessionKv {
     /// effective context of an incoming request; llama.cpp may round the
     /// realised `n_ctx` up, so the requested value is the stable identity.
     n_ctx: u32,
+    /// The last prefill into this cache was one-shot work, so nothing will
+    /// resume from it and it protects nothing (see `prefill_plan`).
+    one_shot: bool,
     _model: Arc<LlamaModel>,
 }
 
@@ -301,6 +307,7 @@ impl SessionKv {
             head: None,
             tokens: Vec::new(),
             n_ctx,
+            one_shot: false,
             _model: model,
         })
     }
@@ -379,6 +386,9 @@ pub(super) struct RetainedPrefix<'a> {
     /// matters: it decides whether the cache is worth protecting.
     occupied: usize,
     n_ctx: u32,
+    /// Whether a chat filled the cache, rather than one-shot work nothing
+    /// resumes from.
+    worth_protecting: bool,
 }
 
 impl<'a> RetainedPrefix<'a> {
@@ -390,6 +400,7 @@ impl<'a> RetainedPrefix<'a> {
             tokens: &kv.tokens,
             occupied: kv.occupied(),
             n_ctx: kv.n_ctx,
+            worth_protecting: !kv.one_shot,
         }
     }
 
@@ -409,6 +420,7 @@ impl<'a> RetainedPrefix<'a> {
             tokens: &[],
             occupied: kv.occupied(),
             n_ctx: kv.n_ctx,
+            worth_protecting: !kv.one_shot,
         }
     }
 }
@@ -458,7 +470,12 @@ pub(super) fn prefill_plan(
     if resume >= REUSE_MIN_TOKENS && reusable < prompt.len() {
         return PrefillPlan::ReusePrefix(resume);
     }
-    if is_sacrificial_prompt(prompt.len(), cached.occupied) {
+    // Only a cache a chat filled is worth protecting. One-shot work leaves a
+    // cache nothing resumes from: on a Jetson Orin, a compaction summary stopped
+    // halfway left 13K tokens of summary prompt, and a new conversation's turns
+    // then ran in throwaway contexts, each a full prefill (7-8 s to the first
+    // token), until the conversation outgrew half of it.
+    if cached.worth_protecting && is_sacrificial_prompt(prompt.len(), cached.occupied) {
         return PrefillPlan::SacrificialContext;
     }
     PrefillPlan::FullPrefillInPlace
@@ -1258,8 +1275,12 @@ fn prefill_prompt(
         "prompt prefill plan"
     );
 
-    // Nothing usable in memory: this is the cold start the snapshot exists for.
-    if matches!(plan, PrefillPlan::CreateContext) {
+    // Nothing usable in memory: this is the cold start the snapshot exists for,
+    // whether or not a context of the right size is already allocated.
+    if matches!(
+        plan,
+        PrefillPlan::CreateContext | PrefillPlan::FullPrefillInPlace
+    ) {
         if let Some(slot) = snapshot.as_mut() {
             match seed_from_snapshot(session, model, backend, settings, slot, prompt, n_ctx) {
                 Ok(Some(restored)) => {
@@ -1901,6 +1922,7 @@ pub(super) fn prepare_generation(
         None => {
             if let Some(kv) = ctx.session.as_mut() {
                 kv.session_ctx_mut().ctx_mut().synchronize();
+                kv.one_shot = ctx.one_shot;
             }
         }
     }
@@ -2117,6 +2139,7 @@ pub(super) mod tests {
             tokens,
             occupied: tokens.len(),
             n_ctx,
+            worth_protecting: true,
         }
     }
 
@@ -2132,6 +2155,7 @@ pub(super) mod tests {
             tokens,
             occupied: media_pos + tokens.len(),
             n_ctx,
+            worth_protecting: true,
         }
     }
 
@@ -3337,11 +3361,34 @@ pub(super) mod tests {
             tokens: &[],
             occupied: 3000,
             n_ctx: 4096,
+            worth_protecting: true,
         };
         let prompt = tokens(0..2000);
         assert_eq!(
             prefill_plan(Some(opaque), &prompt, 4096),
             PrefillPlan::FullPrefillInPlace
+        );
+    }
+
+    #[test]
+    fn a_cache_one_shot_work_filled_protects_nothing() {
+        // A compaction summary stopped halfway leaves its prompt in the cache.
+        // The next chat turn takes the slot instead of running in a throwaway
+        // context beside it, as it would beside a chat's cache.
+        let leftover = tokens(10_000..23_000);
+        let chat_turn = tokens(0..4_000);
+        let one_shot = RetainedPrefix {
+            worth_protecting: false,
+            ..retained(&leftover, 16_384)
+        };
+        assert_eq!(
+            prefill_plan(Some(one_shot), &chat_turn, 16_384),
+            PrefillPlan::FullPrefillInPlace
+        );
+        assert_eq!(
+            prefill_plan(Some(retained(&leftover, 16_384)), &chat_turn, 16_384),
+            PrefillPlan::SacrificialContext,
+            "a chat's cache of that size is still protected"
         );
     }
 
@@ -3355,6 +3402,7 @@ pub(super) mod tests {
             tokens: &[],
             occupied: 3000,
             n_ctx: 4096,
+            worth_protecting: true,
         };
         let prompt = tokens(0..378);
         assert_eq!(

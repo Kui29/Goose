@@ -624,6 +624,7 @@ impl LocalInferenceBackend for LlamaCppBackend {
             log: request.log,
             images: &images,
             model_load_ms: request.model_load_ms,
+            one_shot: request.tools.is_empty(),
         };
 
         if use_emulator {
