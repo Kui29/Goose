@@ -731,9 +731,13 @@ pub(super) fn build_context_params(
     ctx_size: u32,
     settings: &crate::local_model_registry::ModelSettings,
 ) -> LlamaContextParams {
+    // Every decode here asks for the last token's logits only (`decode_tokens`, the generation
+    // loop, mtmd's `logits_last`). Left at its default, llama.cpp reserves a 262,144-wide f32 row
+    // of logits per ubatch token for Gemma: 128 MiB at n_ubatch 128, 512 MiB at 512.
     let mut params = LlamaContextParams::default()
         .with_n_ctx(NonZeroU32::new(ctx_size))
-        .with_swa_full(true);
+        .with_swa_full(true)
+        .with_n_outputs_max(1);
 
     if let Some(n_batch) = settings.n_batch {
         params = params.with_n_batch(n_batch);
