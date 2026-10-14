@@ -2110,8 +2110,9 @@ impl Agent {
                 );
                 // A completeness check's round is used only for the tool calls it makes: its prose
                 // is hidden and dropped (`answers_the_completeness_check` below). So a provider that
-                // can end a generation cheaply may stop it at the first prose.
-                let mut stream = if goal_check_pending {
+                // can end a generation cheaply may stop it at the first prose, unless the round
+                // before showed no answer: then that prose may be the only one there is.
+                let mut stream = if goal_check_pending && !last_assistant_text.is_empty() {
                     goose_providers::request_context::tool_calls_only(stream_call).await?
                 } else {
                     stream_call.await?

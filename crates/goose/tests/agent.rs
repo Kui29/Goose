@@ -2143,6 +2143,8 @@ mod tests {
             call_count: AtomicU32,
             /// Per call, whether it was made as `request_context::tool_calls_only`.
             tool_calls_only: std::sync::Mutex<Vec<bool>>,
+            /// The first call only reasons, showing no text.
+            reasoning_first: bool,
         }
 
         impl GoalTextProvider {
@@ -2150,6 +2152,14 @@ mod tests {
                 Self {
                     call_count: AtomicU32::new(0),
                     tool_calls_only: std::sync::Mutex::new(Vec::new()),
+                    reasoning_first: false,
+                }
+            }
+
+            fn reasoning_first() -> Self {
+                Self {
+                    reasoning_first: true,
+                    ..Self::new()
                 }
             }
         }
@@ -2197,7 +2207,11 @@ mod tests {
                     .unwrap()
                     .push(goose_providers::request_context::wants_tool_calls_only());
                 let text = format!("Response number {count}");
-                let message = Message::assistant().with_text(&text);
+                let message = if self.reasoning_first && count == 0 {
+                    Message::assistant().with_thinking("Weighing the question.", "")
+                } else {
+                    Message::assistant().with_text(&text)
+                };
                 let usage = ProviderUsage::new(
                     "mock-model".to_string(),
                     Usage::new(Some(10), Some(5), Some(15)),
@@ -2310,26 +2324,6 @@ mod tests {
             Ok(())
         }
 
-        /// Hiding the nudge is not enough — the model's ANSWER to it was visible.
-        ///
-        /// The nudge is injected with `with_visibility(false, true)`, so the
-        /// question never reaches the user. The reply to it is an ordinary
-        /// assistant message, and it was being streamed and then concatenated
-        /// onto the real answer.
-        ///
-        /// Observed on gemma-4-E4B for "Check the weather": a correct
-        /// one-sentence answer followed, with no separating space, by "I used
-        /// the current system context ... I cannot keep working on it as I have
-        /// already provided a direct answer." The second half is the model
-        /// answering the completeness check out loud.
-        ///
-        /// This cannot be fixed by wording. The first version of the nudge leaked
-        /// "goal"; the reworded one leaked "keep working on it". Any phrasing
-        /// leaks something, because the model is being asked a question and
-        /// answering it. What has to change is whether the answer is shown.
-        ///
-        /// `GoalTextProvider` never calls a tool, so call 0 is the real answer and
-        /// call 1 is purely the check's own reply — exactly the shape observed.
         /// Only the completeness check's round is made tool-calls-only: its prose is dropped, so
         /// a provider may stop it early. The person's own answer must never be cut short.
         #[tokio::test]
@@ -2381,6 +2375,77 @@ mod tests {
             Ok(())
         }
 
+        /// A check after a round that showed no answer keeps its prose whole: that prose may be
+        /// the only answer the turn has.
+        #[tokio::test]
+        async fn test_a_check_after_no_visible_answer_is_not_cut_short() -> Result<()> {
+            let temp_dir = TempDir::new()?;
+            let session_manager = Arc::new(SessionManager::new(temp_dir.path().to_path_buf()));
+            let agent = create_agent_with_session_naming_disabled(session_manager.clone());
+            let provider = Arc::new(GoalTextProvider::reasoning_first());
+            let session = session_manager
+                .create_session(
+                    PathBuf::default(),
+                    "goal-reasoning-only".to_string(),
+                    SessionType::Hidden,
+                    GooseMode::default(),
+                )
+                .await?;
+            agent
+                .update_provider(
+                    provider.clone(),
+                    ModelConfig::new("mock-model"),
+                    &session.id,
+                )
+                .await?;
+            agent
+                .set_session_goal(&session.id, Some("Ensure the sky is blue".to_string()))
+                .await;
+
+            let reply_stream = agent
+                .reply(
+                    Message::user().with_text("Hello"),
+                    SessionConfig {
+                        id: session.id.clone(),
+                        schedule_id: None,
+                        max_turns: Some(10),
+                        retry_config: None,
+                    },
+                    None,
+                )
+                .await?;
+            tokio::pin!(reply_stream);
+            while reply_stream.next().await.is_some() {}
+
+            let calls = provider.tool_calls_only.lock().unwrap().clone();
+            assert_eq!(
+                calls,
+                vec![false, false],
+                "a reasoning-only round, then the check's round, which is not cut short"
+            );
+            Ok(())
+        }
+
+        /// Hiding the nudge is not enough — the model's ANSWER to it was visible.
+        ///
+        /// The nudge is injected with `with_visibility(false, true)`, so the
+        /// question never reaches the user. The reply to it is an ordinary
+        /// assistant message, and it was being streamed and then concatenated
+        /// onto the real answer.
+        ///
+        /// Observed on gemma-4-E4B for "Check the weather": a correct
+        /// one-sentence answer followed, with no separating space, by "I used
+        /// the current system context ... I cannot keep working on it as I have
+        /// already provided a direct answer." The second half is the model
+        /// answering the completeness check out loud.
+        ///
+        /// This cannot be fixed by wording. The first version of the nudge leaked
+        /// "goal"; the reworded one leaked "keep working on it". Any phrasing
+        /// leaks something, because the model is being asked a question and
+        /// answering it. What has to change is whether the answer is shown.
+        ///
+        /// `GoalTextProvider` never calls a tool, so call 0 is the real answer and
+        /// call 1 is purely the check's own reply — exactly the shape observed.
         #[tokio::test]
         async fn test_the_completeness_checks_own_answer_is_not_shown_to_the_user() -> Result<()> {
             let temp_dir = TempDir::new()?;
