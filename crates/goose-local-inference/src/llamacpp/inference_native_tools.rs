@@ -29,6 +29,8 @@ pub(super) fn generate_with_native_tools(
 
     let message_id = ctx.message_id;
     let tx = ctx.tx;
+    let tool_calls_only = ctx.tool_calls_only;
+    let mut stopped_at_prose = false;
     let mut generated_text = String::new();
     let mut stop_trimmer = StopSuffixTrimmer::new(&template_result.additional_stops);
     let mut stop_string_emitted = false;
@@ -81,6 +83,7 @@ pub(super) fn generate_with_native_tools(
             first_piece_at.get_or_insert_with(std::time::Instant::now);
             generated_text.push_str(piece);
             let mut stop_seen = false;
+            let mut prose_in_piece = false;
 
             // Feed the new piece to the streaming parser
             match stream_parser.update(piece, true) {
@@ -107,6 +110,7 @@ pub(super) fn generate_with_native_tools(
                                     let filtered = output_filter.push_text(content);
                                     let (content, seen) = stop_trimmer.push(&filtered.content);
                                     stop_seen |= seen;
+                                    prose_in_piece |= !content.trim().is_empty();
                                     if !content.is_empty() {
                                         let mut msg = Message::assistant().with_text(content);
                                         msg.id = Some(message_id.to_string());
@@ -150,6 +154,14 @@ pub(super) fn generate_with_native_tools(
             if should_stop {
                 stop_string_emitted = true;
                 Ok(TokenAction::Stop)
+            } else if answers_in_prose(
+                tool_calls_only,
+                prose_in_piece,
+                accumulated_tool_calls.len(),
+            ) {
+                // Ends like a stop string would, keeping the retained cache and the usage report.
+                stopped_at_prose = true;
+                Ok(TokenAction::Stop)
             } else {
                 Ok(TokenAction::Continue)
             }
@@ -164,6 +176,14 @@ pub(super) fn generate_with_native_tools(
             session.record_generated(&decoded_tokens);
         }
     }
+    if stopped_at_prose {
+        tracing::info!(
+            target: "giap::kv",
+            output_tokens = output_token_count,
+            "a generation used only for its tool calls began in prose; stopped there"
+        );
+    }
+
     // Release the throwaway KV cache as soon as the tokens are drained rather
     // than at end of scope, so it overlaps the retained one for as short a time
     // as possible.
@@ -336,6 +356,13 @@ fn extract_oai_tool_call_contents(deltas: &[Value]) -> Vec<MessageContent> {
         .collect()
 }
 
+/// A generation used only for its tool calls (a completeness check's round) that writes visible
+/// text before any tool call is answering in prose, which the agent drops; decoding the rest of it
+/// is wasted. The llama.cpp parser keeps a tool call out of the text it streams.
+fn answers_in_prose(tool_calls_only: bool, visible_text: bool, tool_calls_so_far: usize) -> bool {
+    tool_calls_only && visible_text && tool_calls_so_far == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -437,6 +464,23 @@ mod tests {
         ];
         let contents = extract_oai_tool_call_contents(&deltas);
         assert!(contents.is_empty());
+    }
+
+    #[test]
+    fn only_a_tool_calls_only_generation_stops_at_its_first_prose() {
+        assert!(answers_in_prose(true, true, 0));
+        assert!(
+            !answers_in_prose(true, false, 0),
+            "whitespace or thinking is not prose"
+        );
+        assert!(
+            !answers_in_prose(true, true, 1),
+            "text after a tool call is not the answer"
+        );
+        assert!(
+            !answers_in_prose(false, true, 0),
+            "an ordinary turn runs to its end"
+        );
     }
 
     #[test]

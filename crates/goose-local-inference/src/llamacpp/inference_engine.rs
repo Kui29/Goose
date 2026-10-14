@@ -96,6 +96,8 @@ pub(super) struct GenerationContext<'a> {
     /// The request carries no tools: one-shot work (a compaction's summary,
     /// memory extraction, a title) rather than a turn of a chat.
     pub one_shot: bool,
+    /// Only a tool call from this generation is used (`LocalGenerationRequest::tool_calls_only`).
+    pub tool_calls_only: bool,
 }
 
 pub(super) struct LoadedModel {

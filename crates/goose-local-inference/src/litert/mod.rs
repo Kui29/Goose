@@ -1849,6 +1849,7 @@ mod tests {
                         log: &mut log,
                         replaces_history: false,
                         session_id: None,
+                        tool_calls_only: false,
                     },
                 )
             });

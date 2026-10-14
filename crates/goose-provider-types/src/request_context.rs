@@ -4,6 +4,7 @@
 tokio::task_local! {
     static REPLACES_HISTORY: bool;
     static SESSION: Option<String>;
+    static TOOL_CALLS_ONLY: bool;
 }
 
 /// Runs `f` as a call whose answer replaces the history of the conversation it is about, as a
@@ -36,6 +37,19 @@ pub fn session() -> Option<String> {
     SESSION.try_with(|session| session.clone()).ok().flatten()
 }
 
+/// Runs `f` as a call whose answer is used only if it calls a tool, as a completeness check's
+/// round is: the agent hides and drops its prose. A provider that can end a generation without
+/// losing what it keeps may stop at the first text that comes before any tool call.
+pub async fn tool_calls_only<F: std::future::Future>(f: F) -> F::Output {
+    TOOL_CALLS_ONLY.scope(true, f).await
+}
+
+/// Whether the current call is [`tool_calls_only`]; `false` outside it. Read it before handing
+/// work to another task.
+pub fn wants_tool_calls_only() -> bool {
+    TOOL_CALLS_ONLY.try_with(|only| *only).unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -54,6 +68,13 @@ mod tests {
                 .await
                 .unwrap();
         assert!(!inherited, "read it before spawning");
+    }
+
+    #[tokio::test]
+    async fn only_a_call_made_inside_the_scope_wants_tool_calls_only() {
+        assert!(!wants_tool_calls_only());
+        assert!(tool_calls_only(async { wants_tool_calls_only() }).await);
+        assert!(!wants_tool_calls_only(), "the scope ends with its future");
     }
 
     #[tokio::test]

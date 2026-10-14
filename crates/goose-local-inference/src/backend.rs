@@ -34,6 +34,11 @@ pub(super) struct LocalGenerationRequest<'a> {
     /// The conversation (goose session) the call is made for, when the caller said
     /// (see `request_context::for_session`).
     pub session_id: Option<String>,
+    /// Only a tool call from this generation is used (see `request_context::tool_calls_only`). The
+    /// llama.cpp native-tools path stops at the first prose. LiteRT-LM ignores it, because it can
+    /// end a turn only by cancelling it, and a cancelled conversation is not kept. The
+    /// emulated-tools path ignores it too, because a tool call starts there as text.
+    pub tool_calls_only: bool,
 }
 
 pub(super) trait LocalInferenceBackend: Send + Sync {
