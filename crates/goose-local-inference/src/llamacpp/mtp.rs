@@ -427,8 +427,20 @@ mod tests {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(2048);
+        // Every position asks for logits, so the context reserves outputs for the largest batch;
+        // one built for plain decoding reserves a single row, and llama.cpp aborts past it.
+        const BATCHES: [usize; 11] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 13, 17];
         let settings = greedy(None);
-        let mut kv = SessionKv::create(&model, None, backend, n_ctx, &settings).expect("context");
+        let mut ctx = model
+            .new_context(
+                backend.llama_backend(),
+                crate::llamacpp::inference_engine::build_context_params(
+                    n_ctx,
+                    &settings,
+                    BATCHES[BATCHES.len() - 1] as u32,
+                ),
+            )
+            .expect("context");
         let filler = model.token_eos();
 
         let mut pos = 0i32;
@@ -440,7 +452,6 @@ mod tests {
                     batch.add(filler, *pos + i as i32, &[0], true).expect("add");
                 }
                 let t = std::time::Instant::now();
-                let ctx = kv.session_ctx_mut().ctx_mut();
                 ctx.decode(&mut batch).expect("decode");
                 ctx.synchronize();
                 total += t.elapsed().as_secs_f64() * 1000.0;
@@ -459,7 +470,7 @@ mod tests {
         let t1 = warmed(1, &mut pos);
         eprintln!("target forward, logits at every position:");
         eprintln!("   n     ms   ms/n   T(n)/T(1)   verdict at full acceptance");
-        for n in [1usize, 2, 3, 4, 5, 6, 7, 8, 9, 13, 17] {
+        for n in BATCHES {
             let t = warmed(n, &mut pos);
             let per = t / n as f64;
             eprintln!(
