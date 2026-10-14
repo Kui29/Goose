@@ -1869,7 +1869,6 @@ fn reuse_media_head(
 #[allow(clippy::too_many_arguments)]
 fn prefill_multimodal(
     session: &mut Option<SessionKv>,
-    draft: Option<&Arc<LlamaModel>>,
     model: &Arc<LlamaModel>,
     mtmd_ctx: Option<&MtmdContext>,
     backend: &LlamaCppBackend,
@@ -1967,9 +1966,10 @@ fn prefill_multimodal(
     }
 
     // Release the retained cache before allocating its replacement so the two
-    // KV caches are never resident together.
+    // KV caches are never resident together. No drafter: a media prompt gives it
+    // no token sequence to draft from.
     *session = None;
-    let mut kv = SessionKv::create(model, draft, backend, n_ctx, settings)?;
+    let mut kv = SessionKv::create(model, None, backend, n_ctx, settings)?;
 
     let n_batch = kv.ctx.ctx_mut().n_batch() as i32;
     let n_past = chunks
@@ -2084,6 +2084,7 @@ pub(super) fn prepare_generation(
     );
     let cap = context_cap(ctx.settings, ctx.context_limit, n_ctx_train, memory_max_ctx);
     let token_budget = cap.saturating_sub(min_generation_headroom);
+    let t_ctx_done = std::time::Instant::now();
     let estimated_image_tokens = ctx.images.len() * ctx.settings.image_token_estimate;
 
     let template_result = match apply_template(full_tools_json) {
@@ -2159,10 +2160,15 @@ pub(super) fn prepare_generation(
         }
     };
 
+    let t_render_done = std::time::Instant::now();
     let _ = ctx.log.write(
         &serde_json::json!({"applied_prompt": &template_result.prompt}),
         None,
     );
+    let t_log_done = std::time::Instant::now();
+    // (tokenize, validate, plan+decode) for the text path; the multimodal path
+    // has no flat token vector to time the same way.
+    let mut text_breakdown: Option<(u128, u128, u128)> = None;
 
     let (prompt_token_count, mut prefilled, prompt_tokens) = if !ctx.images.is_empty() {
         // The multimodal path prefills through mtmd chunks and never produces a
@@ -2170,7 +2176,6 @@ pub(super) fn prepare_generation(
         // which is consistent with the vision request bypassing KV retention too.
         let (ptc, prefilled) = prefill_multimodal(
             ctx.session,
-            ctx.draft,
             ctx.model,
             ctx.mtmd_ctx,
             ctx.backend,
@@ -2185,6 +2190,7 @@ pub(super) fn prepare_generation(
             .model
             .str_to_token(&template_result.prompt, AddBos::Never)
             .map_err(|e| ProviderError::ExecutionError(e.to_string()))?;
+        let t_tok_done = std::time::Instant::now();
         let (ptc, ectx) = validate_and_compute_context(
             ctx.model,
             ctx.mtmd_ctx.is_some(),
@@ -2194,6 +2200,7 @@ pub(super) fn prepare_generation(
             ctx.settings,
             retained_kv_tokens,
         )?;
+        let t_validate_done = std::time::Instant::now();
         let prefilled = prefill_prompt(
             ctx.session,
             ctx.draft,
@@ -2205,6 +2212,11 @@ pub(super) fn prepare_generation(
             &tokens,
             ectx,
         )?;
+        text_breakdown = Some((
+            t_tok_done.duration_since(t_log_done).as_millis(),
+            t_validate_done.duration_since(t_tok_done).as_millis(),
+            t_validate_done.elapsed().as_millis(),
+        ));
         (ptc, prefilled, tokens)
     };
 
@@ -2228,6 +2240,22 @@ pub(super) fn prepare_generation(
                 kv.tokens = tokens;
             }
         }
+    }
+
+    if let Some((tokenize_ms, validate_ms, plan_and_decode_ms)) = text_breakdown {
+        tracing::debug!(
+            target: "giap::kv",
+            memory_estimate_ms = t_ctx_done.duration_since(prefill_started).as_millis(),
+            render_ms = t_render_done.duration_since(t_ctx_done).as_millis(),
+            log_write_ms = t_log_done.duration_since(t_render_done).as_millis(),
+            tokenize_ms,
+            validate_ms,
+            plan_and_decode_ms,
+            total_ms = prefill_started.elapsed().as_millis(),
+            prompt_tokens = prompt_token_count,
+            reused_prefix_tokens = prefilled.reused_prefix_tokens,
+            "prefill breakdown"
+        );
     }
 
     Ok(PreparedGeneration {
@@ -2295,7 +2323,10 @@ pub(super) fn generation_loop(
     // a prompt the target has moved past, so every draft is rejected and the
     // speedup silently becomes a slowdown. This is the single point every path
     // passes through with the prefill finished.
-    if let Some(mtp) = ctx.mtp_mut() {
+    // A media prompt's tokens are not all text, so a session a text turn left
+    // with a drafter does not speculate on it.
+    let speculative = prompt_tokens.len() == prompt_token_count;
+    if let Some(mtp) = ctx.mtp_mut().filter(|_| speculative) {
         mtp.begin(prompt_tokens)?;
     }
 
@@ -2334,7 +2365,7 @@ pub(super) fn generation_loop(
         decoded.push(token);
         sequence.push(token);
 
-        if ctx.mtp_mut().is_some() {
+        if speculative && ctx.mtp_mut().is_some() {
             let n_past = (sequence.len() - 1) as i32;
             let step = {
                 let mtp = ctx.mtp_mut().expect("checked above");

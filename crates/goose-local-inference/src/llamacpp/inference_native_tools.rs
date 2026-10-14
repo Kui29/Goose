@@ -34,9 +34,15 @@ pub(super) fn generate_with_native_tools(
     let mut stop_string_emitted = false;
 
     // Initialize streaming parser — handles thinking tokens, tool calls, etc.
+    let t_parser = std::time::Instant::now();
     let mut stream_parser = template_result.streaming_state_oaicompat().map_err(|e| {
         ProviderError::ExecutionError(format!("Failed to init streaming parser: {}", e))
     })?;
+    tracing::debug!(
+        target: "giap::kv",
+        parser_init_ms = t_parser.elapsed().as_millis(),
+        "streaming parser ready"
+    );
 
     // Feed the generation prompt to the parser so it knows the context.
     // The model may echo this prefix; the parser needs to see it to strip it.
