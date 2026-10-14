@@ -2456,10 +2456,11 @@ pub(super) mod tests {
         );
     }
 
+    /// Without a limit from the registry or the caller, the memory estimate caps the window.
     #[test]
     fn test_effective_context_size_capped_by_memory() {
         assert_eq!(
-            effective_context_size(100, &default_settings(), 4096, 4096, Some(800)),
+            effective_context_size(100, &default_settings(), 0, 4096, Some(800)),
             800
         );
     }
@@ -2467,8 +2468,17 @@ pub(super) mod tests {
     #[test]
     fn test_effective_context_size_memory_smaller_than_prompt() {
         assert_eq!(
-            effective_context_size(600, &default_settings(), 4096, 4096, Some(700)),
+            effective_context_size(600, &default_settings(), 0, 4096, Some(700)),
             700
+        );
+    }
+
+    /// A limit the host set wins over the memory estimate: the host owns the budget.
+    #[test]
+    fn test_effective_context_size_a_set_limit_outranks_the_memory_estimate() {
+        assert_eq!(
+            effective_context_size(100, &default_settings(), 4096, 4096, Some(800)),
+            4096
         );
     }
 
@@ -2502,9 +2512,11 @@ pub(super) mod tests {
 
     #[test]
     fn test_context_cap_memory_limited() {
+        assert_eq!(context_cap(&default_settings(), 0, 8192, Some(2048)), 2048);
         assert_eq!(
             context_cap(&default_settings(), 4096, 8192, Some(2048)),
-            2048
+            4096,
+            "a limit the host set wins over the memory estimate"
         );
     }
 
