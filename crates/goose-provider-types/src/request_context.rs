@@ -3,6 +3,7 @@
 
 tokio::task_local! {
     static REPLACES_HISTORY: bool;
+    static SESSION: Option<String>;
 }
 
 /// Runs `f` as a call whose answer replaces the history of the conversation it is about, as a
@@ -19,6 +20,20 @@ pub fn replaces_history() -> bool {
     REPLACES_HISTORY
         .try_with(|replaces| *replaces)
         .unwrap_or(false)
+}
+
+/// Runs `f` as a call made for the conversation `session_id`. goose's `with_session_id` scopes
+/// every provider call this way, so a provider keeping one conversation between calls can tell
+/// whose it is: a compaction's summary replaces the history of the conversation it summarises,
+/// not of whichever conversation the provider happens to hold.
+pub async fn for_session<F: std::future::Future>(session_id: Option<String>, f: F) -> F::Output {
+    SESSION.scope(session_id, f).await
+}
+
+/// The conversation the current call is made for; `None` outside [`for_session`]. Like
+/// [`replaces_history`], read it before handing work to another task.
+pub fn session() -> Option<String> {
+    SESSION.try_with(|session| session.clone()).ok().flatten()
 }
 
 #[cfg(test)]
@@ -39,5 +54,21 @@ mod tests {
                 .await
                 .unwrap();
         assert!(!inherited, "read it before spawning");
+    }
+
+    #[tokio::test]
+    async fn a_call_knows_the_conversation_it_is_made_for() {
+        assert_eq!(session(), None);
+        let inner = for_session(Some("chat".to_string()), async {
+            let summary = for_session(Some("older".to_string()), async { session() }).await;
+            (summary, session())
+        })
+        .await;
+        assert_eq!(
+            inner,
+            (Some("older".to_string()), Some("chat".to_string())),
+            "the innermost scope wins, and ends with its future"
+        );
+        assert_eq!(session(), None);
     }
 }

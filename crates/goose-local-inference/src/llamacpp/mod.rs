@@ -436,7 +436,11 @@ impl LocalInferenceBackend for LlamaCppBackend {
             model_path.display()
         );
 
-        let mut params = LlamaModelParams::default();
+        // Explicit, because the default (`AUTO`) turns mmap off on an integrated GPU: on a Jetson
+        // Orin that copied the CPU-side tensors (Gemma's per-layer embeddings and token table,
+        // 1,872 MiB for E4B) into pinned host memory nothing can reclaim. Mapped, they are page
+        // cache, and a token reads only its own rows.
+        let mut params = LlamaModelParams::default().with_use_mmap(true);
         if let Some(n_gpu_layers) = settings.n_gpu_layers {
             params = params.with_n_gpu_layers(n_gpu_layers);
         }
@@ -620,6 +624,7 @@ impl LocalInferenceBackend for LlamaCppBackend {
             log: request.log,
             images: &images,
             model_load_ms: request.model_load_ms,
+            one_shot: request.tools.is_empty(),
         };
 
         if use_emulator {

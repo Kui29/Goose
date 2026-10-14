@@ -95,6 +95,8 @@ struct MainConversation {
     identity: Identity,
     options: Options,
     consumed: Vec<Value>,
+    /// The goose session whose turn it last answered, when the caller said.
+    session: Option<String>,
 }
 
 impl MainConversation {
@@ -516,7 +518,7 @@ impl LocalInferenceBackend for LiteRtBackend {
             Plan::Extend { from } => extend(loaded, &messages, from, &request),
             Plan::Rematch => rematch(loaded, identity, options, &messages, &request),
             Plan::Recreate => {
-                set_aside(loaded, request.replaces_history);
+                set_aside(loaded, &request);
                 recreate(loaded, identity, options, &messages, &request, true)
             }
             Plan::Throwaway => throwaway(loaded, &identity, options, &messages, &request),
@@ -570,7 +572,10 @@ fn extend(
         false,
     );
     match &turn {
-        Ok(Turn::Completed(done)) => main.record(tail, done),
+        Ok(Turn::Completed(done)) => {
+            main.record(tail, done);
+            main.session.clone_from(&request.session_id);
+        }
         _ => loaded.main = None,
     }
     turn
@@ -625,6 +630,7 @@ fn rematch(
         Ok(Turn::Completed(done)) => {
             main.consumed.clear();
             main.record(messages, done);
+            main.session.clone_from(&request.session_id);
         }
         _ => loaded.main = None,
     }
@@ -673,7 +679,15 @@ fn recreate(
                 match start_turn(&mut conversation, &input, !restored) {
                     Ok(started) => {
                         let turn = finish_turn(&mut conversation, started, request);
-                        retain(loaded, conversation, identity, options, messages, &turn);
+                        retain(
+                            loaded,
+                            conversation,
+                            identity,
+                            options,
+                            request,
+                            messages,
+                            &turn,
+                        );
                         return turn;
                     }
                     Err(error) => tracing::warn!(
@@ -703,7 +717,15 @@ fn recreate(
         request,
         true,
     );
-    retain(loaded, conversation, identity, options, messages, &turn);
+    retain(
+        loaded,
+        conversation,
+        identity,
+        options,
+        request,
+        messages,
+        &turn,
+    );
     turn
 }
 
@@ -713,6 +735,7 @@ fn retain(
     conversation: ffi::Conversation,
     identity: Identity,
     options: Options,
+    request: &LocalGenerationRequest<'_>,
     messages: &[Value],
     turn: &Result<Turn, ProviderError>,
 ) {
@@ -722,6 +745,7 @@ fn retain(
             identity,
             options,
             consumed: Vec::new(),
+            session: request.session_id.clone(),
         };
         main.record(messages, done);
         loaded.main = Some(main);
@@ -739,7 +763,7 @@ fn throwaway(
     request: &LocalGenerationRequest<'_>,
 ) -> Result<Turn, ProviderError> {
     if loaded.snapshots.is_some() {
-        set_aside(loaded, request.replaces_history);
+        set_aside(loaded, request);
     }
     let history = messages.len() - 1;
     let mut conversation = open_conversation(
@@ -759,9 +783,8 @@ fn throwaway(
 
 /// Deletes the retained conversation, first saving its KV cache as its
 /// family's snapshot when the library can and it holds enough to be worth
-/// restoring. `replaces_history`: the call it is set aside for replaces its
-/// history, as a compaction's summary does.
-fn set_aside(loaded: &mut LoadedModel, replaces_history: bool) {
+/// restoring.
+fn set_aside(loaded: &mut LoadedModel, request: &LocalGenerationRequest<'_>) {
     let Some(main) = loaded.main.take() else {
         return;
     };
@@ -775,13 +798,13 @@ fn set_aside(loaded: &mut LoadedModel, replaces_history: bool) {
     let tokens = main.conversation.token_count().unwrap_or(0);
     let path = snapshots.path(&main.identity, main.options);
     let family_has_snapshot = path.is_file();
-    if !worth_saving(
-        &main.identity,
-        tokens,
-        replaces_history,
-        family_has_snapshot,
-    ) {
-        if replaces_history && family_has_snapshot {
+    let replaced = replaces_its_history(
+        request.replaces_history,
+        main.session.as_deref(),
+        request.session_id.as_deref(),
+    );
+    if !worth_saving(&main.identity, tokens, replaced, family_has_snapshot) {
+        if replaced && family_has_snapshot {
             tracing::info!(
                 target: "giap::kv",
                 backend = LITERT_BACKEND_ID,
@@ -809,6 +832,21 @@ fn set_aside(loaded: &mut LoadedModel, replaces_history: bool) {
             "Could not save the retained LiteRT-LM conversation's KV snapshot"
         ),
     }
+}
+
+/// Whether the call a conversation is set aside for replaces that
+/// conversation's own history. A compaction's summary replaces the history of
+/// the session it summarises, which is the retained conversation's only when
+/// both name the same session. On a Jetson Orin the quiet pass summarised an
+/// older conversation after every turn of the one being talked in; that one
+/// was not saved, and each of its turns re-prefilled 800-2,000 tokens from an
+/// older snapshot (first token 7-14 s instead of about 1 s).
+fn replaces_its_history(
+    replaces_history: bool,
+    retained_session: Option<&str>,
+    call_session: Option<&str>,
+) -> bool {
+    replaces_history && retained_session.is_some() && retained_session == call_session
 }
 
 /// Whether a conversation set aside will be asked again, so its KV cache is
@@ -1529,6 +1567,21 @@ mod tests {
     }
 
     #[test]
+    fn only_a_summary_of_the_retained_conversation_replaces_its_history() {
+        assert!(replaces_its_history(true, Some("chat"), Some("chat")));
+        assert!(
+            !replaces_its_history(true, Some("chat"), Some("older")),
+            "summarising another conversation leaves the retained one to resume"
+        );
+        assert!(
+            !replaces_its_history(true, None, None),
+            "with no session named, saving is the safe side"
+        );
+        assert!(!replaces_its_history(true, Some("chat"), None));
+        assert!(!replaces_its_history(false, Some("chat"), Some("chat")));
+    }
+
+    #[test]
     fn snapshot_names_are_stable_and_fields_stay_apart() {
         // FNV-1a 64 over the little-endian length and the bytes, computed
         // independently; a change here orphans every saved snapshot.
@@ -1795,6 +1848,7 @@ mod tests {
                         tx: &tx,
                         log: &mut log,
                         replaces_history: false,
+                        session_id: None,
                     },
                 )
             });
