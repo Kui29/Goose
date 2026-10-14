@@ -2141,12 +2141,15 @@ mod tests {
 
         struct GoalTextProvider {
             call_count: AtomicU32,
+            /// Per call, whether it was made as `request_context::tool_calls_only`.
+            tool_calls_only: std::sync::Mutex<Vec<bool>>,
         }
 
         impl GoalTextProvider {
             fn new() -> Self {
                 Self {
                     call_count: AtomicU32::new(0),
+                    tool_calls_only: std::sync::Mutex::new(Vec::new()),
                 }
             }
         }
@@ -2189,6 +2192,10 @@ mod tests {
                 _tools: &[Tool],
             ) -> Result<MessageStream, ProviderError> {
                 let count = self.call_count.fetch_add(1, Ordering::SeqCst);
+                self.tool_calls_only
+                    .lock()
+                    .unwrap()
+                    .push(goose_providers::request_context::wants_tool_calls_only());
                 let text = format!("Response number {count}");
                 let message = Message::assistant().with_text(&text);
                 let usage = ProviderUsage::new(
@@ -2323,6 +2330,57 @@ mod tests {
         ///
         /// `GoalTextProvider` never calls a tool, so call 0 is the real answer and
         /// call 1 is purely the check's own reply — exactly the shape observed.
+        /// Only the completeness check's round is made tool-calls-only: its prose is dropped, so
+        /// a provider may stop it early. The person's own answer must never be cut short.
+        #[tokio::test]
+        async fn test_only_the_completeness_check_is_tool_calls_only() -> Result<()> {
+            let temp_dir = TempDir::new()?;
+            let session_manager = Arc::new(SessionManager::new(temp_dir.path().to_path_buf()));
+            let agent = create_agent_with_session_naming_disabled(session_manager.clone());
+            let provider = Arc::new(GoalTextProvider::new());
+            let session = session_manager
+                .create_session(
+                    PathBuf::default(),
+                    "goal-tool-calls-only".to_string(),
+                    SessionType::Hidden,
+                    GooseMode::default(),
+                )
+                .await?;
+            agent
+                .update_provider(
+                    provider.clone(),
+                    ModelConfig::new("mock-model"),
+                    &session.id,
+                )
+                .await?;
+            agent
+                .set_session_goal(&session.id, Some("Ensure the sky is blue".to_string()))
+                .await;
+
+            let reply_stream = agent
+                .reply(
+                    Message::user().with_text("Hello"),
+                    SessionConfig {
+                        id: session.id.clone(),
+                        schedule_id: None,
+                        max_turns: Some(10),
+                        retry_config: None,
+                    },
+                    None,
+                )
+                .await?;
+            tokio::pin!(reply_stream);
+            while reply_stream.next().await.is_some() {}
+
+            let calls = provider.tool_calls_only.lock().unwrap().clone();
+            assert_eq!(
+                calls,
+                vec![false, true],
+                "the answer, then the completeness check's round, and only that one tool-calls-only"
+            );
+            Ok(())
+        }
+
         #[tokio::test]
         async fn test_the_completeness_checks_own_answer_is_not_shown_to_the_user() -> Result<()> {
             let temp_dir = TempDir::new()?;

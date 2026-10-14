@@ -2099,7 +2099,7 @@ impl Agent {
                     max_turns,
                 ).await;
 
-                let mut stream = Self::stream_response_from_provider(
+                let stream_call = Self::stream_response_from_provider(
                     self.provider().await?,
                     model_config.clone(),
                     &session_config.id,
@@ -2107,7 +2107,15 @@ impl Agent {
                     conversation_with_moim.messages(),
                     &tools,
                     &toolshim_tools,
-                ).await?;
+                );
+                // A completeness check's round is used only for the tool calls it makes: its prose
+                // is hidden and dropped (`answers_the_completeness_check` below). So a provider that
+                // can end a generation cheaply may stop it at the first prose.
+                let mut stream = if goal_check_pending {
+                    goose_providers::request_context::tool_calls_only(stream_call).await?
+                } else {
+                    stream_call.await?
+                };
                 last_assistant_text.clear();
 
                 let current_turn_tool_count = conversation.messages().iter()
