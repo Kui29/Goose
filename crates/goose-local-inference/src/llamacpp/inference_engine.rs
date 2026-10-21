@@ -1971,7 +1971,11 @@ fn prefill_multimodal(
     // KV caches are never resident together. No drafter: a media prompt gives it
     // no token sequence to draft from.
     *session = None;
-    let mut kv = SessionKv::create(model, None, backend, n_ctx, settings)?;
+    let mut mm_settings = settings.clone();
+    if mm_settings.n_ubatch.map_or(false, |u| u < 512) {
+        mm_settings.n_ubatch = Some(512);
+    }
+    let mut kv = SessionKv::create(model, None, backend, n_ctx, &mm_settings)?;
 
     let n_batch = kv.ctx.ctx_mut().n_batch() as i32;
     let n_past = chunks

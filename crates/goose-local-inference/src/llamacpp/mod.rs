@@ -500,7 +500,8 @@ impl LocalInferenceBackend for LlamaCppBackend {
 
         let templates = load_chat_templates(&model, settings)?;
 
-        let mtmd_ctx = Self::init_mtmd_context(&model, &resolved.mmproj_path, settings);
+        // Vision encoder is loaded on-demand per turn rather than holding ~1 GB resident in VRAM.
+        let mtmd_ctx = None;
 
         tracing::info!(
             backend = self.id(),
@@ -678,7 +679,7 @@ impl LocalInferenceBackend for LlamaCppBackend {
             tool_calls_only: request.tool_calls_only,
         };
 
-        if use_emulator {
+        let result = if use_emulator {
             generate_with_emulated_tools(&mut gen_ctx, code_mode_enabled, &oai_messages_json)
         } else {
             generate_with_native_tools(
@@ -687,7 +688,11 @@ impl LocalInferenceBackend for LlamaCppBackend {
                 full_tools_json.as_deref(),
                 compact_tools.as_deref(),
             )
+        };
+        if !images.is_empty() {
+            loaded.mtmd_ctx = None;
         }
+        result
     }
 
     fn available_memory_bytes(&self) -> u64 {
