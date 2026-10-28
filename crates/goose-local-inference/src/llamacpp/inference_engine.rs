@@ -3403,6 +3403,275 @@ pub(super) mod tests {
         );
     }
 
+    /// A helper turn beside the prime (a throwaway context) against handing it the one context and
+    /// rebuilding the prime from its preamble snapshot or a suspend file. Stop the pond first.
+    #[test]
+    #[ignore = "requires a real GGUF on disk; run with --ignored"]
+    fn what_a_helper_turn_costs_the_prime() {
+        use crate::llamacpp::prompt_snapshot::SnapshotSlot;
+        use llama_cpp_2::model::params::LlamaModelParams;
+        use llama_cpp_2::model::AddBos;
+        use std::time::Instant;
+
+        let env_path = |name: &str| std::env::var_os(name).map(std::path::PathBuf::from);
+        let env_num = |name: &str, default: usize| {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default)
+        };
+        let Some(src) = env_path("GIAP_TEST_GGUF").or_else(live_model_path) else {
+            eprintln!("skipping: no local GGUF found");
+            return;
+        };
+        let n_ctx = env_num("GIAP_TEST_NCTX", 16384) as u32;
+        let preamble_len = env_num("GIAP_TEST_PREAMBLE", 3000);
+        let role_len = env_num("GIAP_TEST_ROLE", 1100);
+        let task_len = 300;
+
+        let tmp = tempfile::tempdir().expect("tempdir; set TMPDIR to the model's filesystem");
+        let link = |src: &std::path::Path, name: &str| {
+            let dst = tmp.path().join(name);
+            let real = std::fs::canonicalize(src).expect("resolve the model path");
+            std::fs::hard_link(&real, &dst).expect("hard link the model, never symlink it");
+            dst
+        };
+        let model_path = link(&src, "model.gguf");
+        let draft_path = env_path("GIAP_TEST_DRAFT").map(|d| link(&d, "draft.gguf"));
+        let _env = env_lock::lock_env([("GOOSE_PATH_ROOT", Some(tmp.path().to_str().unwrap()))]);
+
+        let backend = shared_backend();
+        let params = LlamaModelParams::default().with_n_gpu_layers(99);
+        let load = |path: &std::path::Path| {
+            Arc::new(
+                LlamaModel::load_from_file(backend.llama_backend(), path, &params)
+                    .expect("load model"),
+            )
+        };
+        let model = load(&model_path);
+        let draft = draft_path.as_deref().map(load);
+        // The Orin's registry entry for E4B, so the contexts are the size the pond allocates.
+        let settings = ModelSettings {
+            context_size: Some(n_ctx),
+            n_batch: Some(512),
+            n_ubatch: Some(512),
+            type_k: Some("f16".to_string()),
+            type_v: Some("f16".to_string()),
+            n_gpu_layers: Some(99),
+            flash_attention: Some(true),
+            n_threads: Some(4),
+            ..Default::default()
+        };
+
+        let text = |sentence: &str, n: usize, bos: AddBos| {
+            let mut tokens = model
+                .str_to_token(&sentence.repeat(n / 4 + 8), bos)
+                .expect("tokenize");
+            assert!(tokens.len() >= n, "filler too short for {n} tokens");
+            tokens.truncate(n);
+            tokens
+        };
+        let preamble = text(
+            "The pond keeps its own notes about the household and answers when asked. ",
+            preamble_len,
+            AddBos::Always,
+        );
+        let role = text(
+            "You are the pond's schedule helper: you read calendars and report back. ",
+            role_len,
+            AddBos::Always,
+        );
+        let task = text(
+            "Find a free hour on Saturday for the two of them and say why it fits. ",
+            task_len,
+            AddBos::Never,
+        );
+        let helper: Vec<LlamaToken> = role.iter().chain(&task).copied().collect();
+        let probe = model
+            .str_to_token(" So the answer is", AddBos::Never)
+            .expect("tokenize probe")[0];
+
+        let mem_available_mib = || -> Option<i64> {
+            let info = std::fs::read_to_string("/proc/meminfo").ok()?;
+            let kb = info.lines().find_map(|l| l.strip_prefix("MemAvailable:"))?;
+            kb.trim()
+                .trim_end_matches("kB")
+                .trim()
+                .parse::<i64>()
+                .ok()
+                .map(|kb| kb / 1024)
+        };
+        let taken = |before: Option<i64>| {
+            before
+                .zip(mem_available_mib())
+                .map_or("n/a".to_string(), |(b, a)| format!("{} MiB", b - a))
+        };
+        let ms = |t: Instant| t.elapsed().as_millis();
+        let answer_after_probe = |kv: &mut SessionKv, pos: usize| {
+            decode_tokens(kv.ctx.ctx_mut(), &[probe], pos).expect("decode probe");
+            kv.ctx
+                .ctx_mut()
+                .get_logits_ith(0)
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map(|(i, _)| i)
+                .expect("logits")
+        };
+
+        let mut slot =
+            SnapshotSlot::for_model(&model_path, n_ctx, &settings).expect("slot for a real model");
+        for (name, tokens) in [("prime preamble", &preamble), ("role preamble", &role)] {
+            let mut kv =
+                SessionKv::create(&model, draft.as_ref(), backend, n_ctx, &settings).expect("ctx");
+            decode_tokens(kv.ctx.ctx_mut(), tokens, 0).expect("prefill preamble");
+            let t = Instant::now();
+            assert!(
+                slot.write(kv.ctx.ctx(), tokens),
+                "{name} snapshot must be written"
+            );
+            eprintln!("{name}: {} tokens saved in {} ms", tokens.len(), ms(t));
+        }
+
+        let mut disagreements = Vec::new();
+        for history_len in [2048usize, 4096, 8192] {
+            let history = text(
+                "Earlier the family talked about the garden, the school run and dinner. ",
+                history_len,
+                AddBos::Never,
+            );
+            let prime: Vec<LlamaToken> = preamble.iter().chain(&history).copied().collect();
+            if prime.len() + 1 > n_ctx as usize {
+                eprintln!("history {history_len}: does not fit n_ctx {n_ctx}, skipped");
+                continue;
+            }
+            let suspend_path = tmp.path().join(format!("prime-{history_len}.kv"));
+
+            let mut session: Option<SessionKv> = None;
+            let before = mem_available_mib();
+            let t = Instant::now();
+            full_prefill(
+                &mut session,
+                draft.as_ref(),
+                &model,
+                backend,
+                &settings,
+                &prime,
+                n_ctx,
+            )
+            .expect("cold prime");
+            let cold_ms = ms(t);
+            let prime_mem = taken(before);
+
+            let t = Instant::now();
+            let suspend_bytes = session
+                .as_ref()
+                .expect("prime")
+                .ctx
+                .ctx()
+                .state_seq_save_file(&suspend_path, 0, &prime)
+                .expect("suspend the prime");
+            let suspend_ms = ms(t);
+            let cold_answer = answer_after_probe(session.as_mut().expect("prime"), prime.len());
+
+            let before = mem_available_mib();
+            let t = Instant::now();
+            let side_n_ctx =
+                sacrificial_context_size(helper.len(), settings.max_output_tokens, n_ctx);
+            let side = sacrificial_prefill(
+                &model,
+                draft.as_ref(),
+                backend,
+                &settings,
+                &helper,
+                side_n_ctx,
+            );
+            let side_ms = ms(t);
+            let side_mem = taken(before);
+            let side_ok = side.is_ok();
+            drop(side);
+
+            let helper_in = |session: &mut Option<SessionKv>, slot: &mut SnapshotSlot| {
+                let t = Instant::now();
+                let restored = seed_from_snapshot(
+                    session,
+                    draft.as_ref(),
+                    &model,
+                    backend,
+                    &settings,
+                    slot,
+                    &helper,
+                    n_ctx,
+                )
+                .expect("helper seed");
+                assert_eq!(
+                    restored,
+                    Some(role.len()),
+                    "the role snapshot must seed the helper"
+                );
+                ms(t)
+            };
+
+            let helper_seed_ms = helper_in(&mut session, &mut slot);
+            let t = Instant::now();
+            session = None;
+            let mut kv =
+                SessionKv::create(&model, draft.as_ref(), backend, n_ctx, &settings).expect("ctx");
+            let (tokens, _) = kv
+                .context_mut()
+                .state_seq_load_file(&suspend_path, 0, n_ctx as usize)
+                .expect("resume the suspended prime");
+            let resume_ms = ms(t);
+            assert_eq!(
+                tokens.len(),
+                prime.len(),
+                "the suspend file must hold the whole prime"
+            );
+            let resumed_answer = answer_after_probe(&mut kv, prime.len());
+            session = Some(kv);
+
+            helper_in(&mut session, &mut slot);
+            let t = Instant::now();
+            let restored = seed_from_snapshot(
+                &mut session,
+                draft.as_ref(),
+                &model,
+                backend,
+                &settings,
+                &mut slot,
+                &prime,
+                n_ctx,
+            )
+            .expect("rebuild the prime");
+            let rebuild_ms = ms(t);
+            assert_eq!(
+                restored,
+                Some(preamble.len()),
+                "the preamble snapshot must seed the prime"
+            );
+            let rebuilt_answer = answer_after_probe(session.as_mut().expect("prime"), prime.len());
+            drop(session);
+            let _ = std::fs::remove_file(&suspend_path);
+
+            eprintln!(
+                "history {history_len} (prime {} tok): cold {cold_ms} ms, context {prime_mem} | \
+                 side context ({side_n_ctx}): {} {side_ms} ms, {side_mem} | helper seeded {helper_seed_ms} ms | \
+                 prime rebuilt {rebuild_ms} ms | suspend {suspend_ms} ms, {:.0} MiB, resume {resume_ms} ms",
+                prime.len(),
+                if side_ok { "ok" } else { "FAILED" },
+                suspend_bytes as f64 / 1_048_576.0,
+            );
+            if rebuilt_answer != cold_answer || resumed_answer != cold_answer {
+                disagreements.push((history_len, cold_answer, rebuilt_answer, resumed_answer));
+            }
+        }
+        assert!(
+            disagreements.is_empty(),
+            "a rebuilt or resumed prime predicted a different next token than the cold one \
+             (history, cold, rebuilt, resumed): {disagreements:?}"
+        );
+    }
+
     /// The process's one llama.cpp backend.
     ///
     /// `LlamaCppBackend::new()` treats a second initialisation as `unreachable!`
