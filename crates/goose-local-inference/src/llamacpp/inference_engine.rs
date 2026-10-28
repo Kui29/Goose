@@ -1271,8 +1271,7 @@ pub(super) fn build_sampler(
     }
 }
 
-/// Validate prompt tokens against memory limits and compute the effective
-/// context size. Returns `(prompt_token_count, effective_ctx)`.
+/// Size the window and check the prompt fits it. Returns `(prompt_token_count, effective_ctx)`.
 pub(super) fn validate_and_compute_context(
     model: &LlamaModel,
     has_mtmd: bool,
@@ -1290,6 +1289,25 @@ pub(super) fn validate_and_compute_context(
     };
     let memory_max_ctx =
         estimate_max_context_for_memory(model, backend, mmproj_overhead, retained_kv_tokens);
+    let effective_ctx = admit_prompt(
+        prompt_token_count,
+        settings,
+        context_limit,
+        n_ctx_train,
+        memory_max_ctx,
+    )?;
+    Ok((prompt_token_count, effective_ctx))
+}
+
+/// The window a prompt gets, or a refusal when the prompt does not fit it. The prompt is never
+/// weighed against memory on its own: the context is created at the window's size either way.
+fn admit_prompt(
+    prompt_token_count: usize,
+    settings: &crate::local_model_registry::ModelSettings,
+    context_limit: usize,
+    n_ctx_train: usize,
+    memory_max_ctx: Option<usize>,
+) -> Result<usize, ProviderError> {
     let effective_ctx = effective_context_size(
         prompt_token_count,
         settings,
@@ -1297,15 +1315,6 @@ pub(super) fn validate_and_compute_context(
         n_ctx_train,
         memory_max_ctx,
     );
-    if let Some(mem_max) = memory_max_ctx {
-        if prompt_token_count > mem_max {
-            return Err(ProviderError::ContextLengthExceeded(format!(
-                "Prompt ({} tokens) exceeds estimated memory capacity ({} tokens). \
-                 Try a smaller model or reduce conversation length.",
-                prompt_token_count, mem_max,
-            )));
-        }
-    }
     if prompt_token_count >= effective_ctx {
         return Err(ProviderError::ContextLengthExceeded(format!(
             "Prompt ({} tokens) exceeds context limit ({} tokens). \
@@ -1313,7 +1322,7 @@ pub(super) fn validate_and_compute_context(
             prompt_token_count, effective_ctx,
         )));
     }
-    Ok((prompt_token_count, effective_ctx))
+    Ok(effective_ctx)
 }
 
 /// Decode `tokens` into sequence 0 starting at absolute position `start_pos`.
@@ -2848,6 +2857,36 @@ pub(super) mod tests {
             context_cap(&default_settings(), 4096, 8192, Some(2048)),
             4096,
             "a limit the host set wins over the memory estimate"
+        );
+    }
+
+    /// The first call after a load has no retained window to credit, so the estimate runs low;
+    /// refusing there sent goose into a recovery compaction before every boot's warm-up.
+    #[test]
+    fn a_set_limit_admits_a_prompt_past_the_memory_estimate() {
+        assert_eq!(
+            admit_prompt(7816, &default_settings(), 16384, 131072, Some(4096)).unwrap(),
+            16384
+        );
+    }
+
+    #[test]
+    fn without_a_set_limit_the_memory_estimate_bounds_the_prompt() {
+        assert!(matches!(
+            admit_prompt(7816, &default_settings(), 0, 131072, Some(4096)),
+            Err(ProviderError::ContextLengthExceeded(_))
+        ));
+    }
+
+    #[test]
+    fn a_prompt_that_fills_the_window_is_refused() {
+        assert!(matches!(
+            admit_prompt(16384, &default_settings(), 16384, 131072, None),
+            Err(ProviderError::ContextLengthExceeded(_))
+        ));
+        assert_eq!(
+            admit_prompt(16383, &default_settings(), 16384, 131072, None).unwrap(),
+            16384
         );
     }
 
