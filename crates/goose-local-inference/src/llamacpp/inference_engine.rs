@@ -1650,8 +1650,8 @@ fn write_snapshot_if_due(
     prompt: &[LlamaToken],
     turn_was_cold: bool,
     class: super::prompt_snapshot::SnapshotClass,
-    // A compile's preamble, which a shared bucket's intersection may have shrunk below.
-    compiled_preamble: Option<usize>,
+    // A compile's shape and preamble, which a shared bucket's intersection may have shrunk below.
+    compiled: Option<(&str, usize)>,
 ) {
     // Writing is not free: measured 21.2 MiB in 314 ms, about 67 MiB/s, which is
     // ~1.6 s for a 6,000-token preamble on an 18 KiB/token model and ~5 s on a
@@ -1671,7 +1671,10 @@ fn write_snapshot_if_due(
     if kv.head.is_some() {
         return;
     }
-    let Some(keep) = compiled_preamble.or_else(|| slot.writable_prefix(prompt)) else {
+    let Some(keep) = compiled
+        .map(|(_, keep)| keep)
+        .or_else(|| slot.writable_prefix(prompt))
+    else {
         return;
     };
     // The cache has to hold what is about to be written, and there has to be a
@@ -1711,7 +1714,12 @@ fn write_snapshot_if_due(
         }
         kv.tokens.extend_from_slice(&prompt[at..keep]);
     }
-    slot.write(kv.ctx.ctx(), &kv.tokens, class);
+    slot.write(
+        kv.ctx.ctx(),
+        &kv.tokens,
+        class,
+        compiled.map(|(shape, _)| shape),
+    );
 
     // Put the tail back: the turn still has to generate from the whole prompt.
     match decode_checkpointed(kv, prompt, keep) {
@@ -1948,7 +1956,7 @@ fn prefill_prompt(
             let kv = session
                 .as_mut()
                 .expect("full_prefill leaves a session on success");
-            slot.write(kv.ctx.ctx(), &kv.tokens, class);
+            slot.write(kv.ctx.ctx(), &kv.tokens, class, compile_prefill);
             if let Err(e) = decode_checkpointed(kv, prompt, keep) {
                 *session = None;
                 return Err(e);
@@ -1974,7 +1982,14 @@ fn prefill_prompt(
         Err(e) => return Err(e),
     }
     // Cold: this path decoded the whole prompt.
-    write_snapshot_if_due(session, snapshot, prompt, true, class, rebuild_preamble);
+    write_snapshot_if_due(
+        session,
+        snapshot,
+        prompt,
+        true,
+        class,
+        compile_prefill.zip(rebuild_preamble),
+    );
     Ok(PrefilledPrompt {
         reused_prefix_tokens: 0,
         transient: None,
@@ -3103,7 +3118,7 @@ pub(super) mod tests {
             kv.tokens.extend_from_slice(&prefix);
             let t = std::time::Instant::now();
             assert!(
-                slot.write(kv.ctx.ctx(), &kv.tokens, SnapshotClass::Shared),
+                slot.write(kv.ctx.ctx(), &kv.tokens, SnapshotClass::Shared, None),
                 "snapshot must be written"
             );
             eprintln!(
@@ -3882,7 +3897,8 @@ pub(super) mod tests {
     }
 
     /// Two compile calls of one shape build its missing snapshot, leave a good one untouched and
-    /// rebuild one whose bytes changed; a real turn afterwards restores the whole preamble.
+    /// rebuild one whose bytes changed; a second shape opening the same way keeps its own beside it,
+    /// and a real turn of either restores its whole preamble.
     #[test]
     #[ignore = "requires a real GGUF on disk; run with --ignored"]
     fn a_compile_builds_keeps_and_repairs_a_shapes_snapshot() {
@@ -3980,12 +3996,50 @@ pub(super) mod tests {
             "the rebuilt snapshot must not be the corrupted bytes"
         );
 
+        let other: Vec<LlamaToken> = preamble[..600]
+            .iter()
+            .copied()
+            .chain(filler(
+                &live.model,
+                "A helper reads one step of a task and writes what it found. ",
+                1000,
+                AddBos::Never,
+            ))
+            .collect();
+        let other_with = |tail: &str| -> Vec<LlamaToken> {
+            let tail = filler(&live.model, tail, 40, AddBos::Never);
+            other.iter().chain(&tail).copied().collect()
+        };
+        prefill!(
+            &other_with("Alpha is the first of two compile calls. "),
+            Some("other-shape")
+        );
+        prefill!(
+            &other_with("Begin the second compile call here. "),
+            Some("other-shape")
+        );
+        assert_eq!(
+            files(&snapshot).len(),
+            2,
+            "a shape opening as another does must keep its own snapshot beside it"
+        );
+
         session = None;
         let reused = prefill!(&real, None);
         assert_eq!(
             reused,
             preamble.len(),
             "a real turn of the shape must restore exactly the compiled preamble"
+        );
+        session = None;
+        let reused = prefill!(
+            &other_with("A step asks what the household eats on Tuesdays. "),
+            None
+        );
+        assert_eq!(
+            reused,
+            other.len(),
+            "a real turn of the second shape must restore its own preamble"
         );
     }
 
@@ -4080,7 +4134,7 @@ pub(super) mod tests {
             decode_tokens(kv.ctx.ctx_mut(), tokens, 0).expect("prefill preamble");
             let t = Instant::now();
             assert!(
-                slot.write(kv.ctx.ctx(), tokens, class),
+                slot.write(kv.ctx.ctx(), tokens, class, None),
                 "{name} snapshot must be written"
             );
             eprintln!("{name}: {} tokens saved in {} ms", tokens.len(), ms(t));

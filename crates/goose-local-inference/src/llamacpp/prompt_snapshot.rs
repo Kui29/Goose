@@ -185,6 +185,13 @@ struct IndexEntry {
     /// `None` for a file written before checksums; the first compile that trusts it records one.
     #[serde(default)]
     checksum: Option<u64>,
+    /// The compile shape that wrote it, whose next snapshot replaces it; `None` for a turn's own write.
+    #[serde(default)]
+    shape: Option<String>,
+    /// [`prefix_id`] of its tokens. A shape's deepest rung can fall inside the base prompt every
+    /// shape shares, so only this tells another shape's snapshot from its own.
+    #[serde(default)]
+    prefix: Option<u64>,
 }
 
 /// What a compile found for a prompt shape's snapshot.
@@ -214,13 +221,12 @@ struct SnapshotIndex {
 }
 
 impl SnapshotIndex {
-    /// The entry sharing the deepest ladder with `want`, if any shares at all.
+    /// The longest entry whose stored prefix begins `prompt`, if any does.
     ///
-    /// Ties go to the entry with MORE tokens: two snapshots agreeing to the same
-    /// rung are equally right about the part that was compared, and the longer
-    /// one saves more of the decode. The prefix check at load time is still what
-    /// makes the choice safe — the ladder narrows, it does not prove.
-    fn best_match(&self, want: &[(usize, u64)], prompt_tokens: usize) -> Option<&IndexEntry> {
+    /// The ladder narrows and a recorded prefix hash proves; for an entry written
+    /// before the hash, the prefix check at load time is what makes the choice safe.
+    fn best_match(&self, prompt: &[LlamaToken]) -> Option<&IndexEntry> {
+        let want = ladder(prompt);
         self.entries
             .iter()
             .filter(|e| {
@@ -231,7 +237,7 @@ impl SnapshotIndex {
                 //
                 // 1. A snapshot at least as long as the prompt leaves nothing to
                 //    decode, which `load` rejects anyway.
-                if e.tokens >= prompt_tokens {
+                if e.tokens >= prompt.len() {
                     return false;
                 }
                 // 2. The ladder has to agree at least as deep as the snapshot's
@@ -239,10 +245,47 @@ impl SnapshotIndex {
                 //    diverges from this prompt BEFORE it ends, so it is not a
                 //    prefix of it and no amount of reading will change that.
                 let own_depth = e.ladder.last().map_or(0, |(d, _)| *d);
-                ladder_agreement(&e.ladder, want) >= own_depth && own_depth > 0
+                if ladder_agreement(&e.ladder, &want) < own_depth || own_depth == 0 {
+                    return false;
+                }
+                // 3. The whole stored prefix, hashed: never another shape's file.
+                e.prefix
+                    .is_none_or(|prefix| prefix_id(&prompt[..e.tokens]) == prefix)
             })
             .max_by_key(|e| e.tokens)
     }
+
+    /// Adds `entry` and returns the files it replaces. The prime and every role open alike, so an
+    /// opening never decides: a named shape replaces only its own, an unnamed write the unnamed one.
+    fn admit(&mut self, mut entry: IndexEntry) -> Vec<String> {
+        if let Some(same) = self.entries.iter().find(|e| e.file == entry.file) {
+            entry.shape = entry.shape.or_else(|| same.shape.clone());
+        }
+        let opening = entry.ladder.first().map(|(_, h)| *h);
+        let replaced: Vec<String> = self
+            .entries
+            .iter()
+            .filter(|e| e.file != entry.file)
+            .filter(|e| match &entry.shape {
+                Some(shape) => e.shape.as_ref() == Some(shape),
+                None => e.shape.is_none() && e.ladder.first().map(|(_, h)| *h) == opening,
+            })
+            .map(|e| e.file.clone())
+            .collect();
+        self.entries
+            .retain(|e| e.file != entry.file && !replaced.contains(&e.file));
+        self.entries.push(entry);
+        replaced
+    }
+}
+
+/// Names a snapshot by everything it holds, so two preambles sharing an opening never share a file.
+fn prefix_id(tokens: &[LlamaToken]) -> u64 {
+    let mut h = Fnv::new();
+    for t in tokens {
+        h.write(&t.0.to_le_bytes());
+    }
+    h.finish()
 }
 
 /// Identity of a snapshot: everything that must match for the stored bytes to
@@ -569,6 +612,7 @@ impl SnapshotSlot {
         ctx: &LlamaContext<'_>,
         tokens: &[LlamaToken],
         class: SnapshotClass,
+        shape: Option<&str>,
     ) -> bool {
         let Some(bucket) = Self::bucket_of(tokens) else {
             return false;
@@ -587,8 +631,9 @@ impl SnapshotSlot {
         }
 
         let rungs = ladder(tokens);
+        let prefix = prefix_id(tokens);
         let file = format!(
-            "v{SNAPSHOT_FORMAT_VERSION}-{:016x}-{:016x}.kv",
+            "v{SNAPSHOT_FORMAT_VERSION}-{:016x}-{:016x}-{prefix:016x}.kv",
             self.key.family(),
             bucket
         );
@@ -609,15 +654,19 @@ impl SnapshotSlot {
                     self.buckets.entry(bucket).or_default().settled = true;
                     return false;
                 }
-                self.index.entries.retain(|e| e.file != file);
-                self.index.entries.push(IndexEntry {
+                let replaced = self.index.admit(IndexEntry {
                     file: file.clone(),
                     tokens: tokens.len(),
                     ladder: rungs,
                     last_used: now_secs(),
                     helper: class == SnapshotClass::Helper,
                     checksum: file_checksum(&final_path),
+                    shape: shape.map(str::to_string),
+                    prefix: Some(prefix),
                 });
+                for old in &replaced {
+                    let _ = std::fs::remove_file(self.dir.join(old));
+                }
                 self.evict_beyond_cap();
                 self.save_index();
 
@@ -629,6 +678,8 @@ impl SnapshotSlot {
                     kib_per_token = bytes as f64 / 1024.0 / tokens.len().max(1) as f64,
                     elapsed_ms = started.elapsed().as_millis() as u64,
                     snapshots_for_model = self.index.entries.len(),
+                    replaced = replaced.len(),
+                    shape = shape.unwrap_or(""),
                     path = %final_path.display(),
                     "kv snapshot saved; this prompt shape now resumes from disk"
                 );
@@ -656,8 +707,7 @@ impl SnapshotSlot {
         ctx: &mut LlamaContext<'_>,
         prompt: &[LlamaToken],
     ) -> Option<usize> {
-        let rungs = ladder(prompt);
-        let chosen = self.index.best_match(&rungs, prompt.len())?.clone();
+        let chosen = self.index.best_match(prompt)?.clone();
         let path = self.dir.join(&chosen.file);
         if !path.exists() {
             self.forget(&chosen.file, "index named a file that is gone");
@@ -816,10 +866,7 @@ impl SnapshotSlot {
         if preamble < SNAPSHOT_MIN_TOKENS {
             return PreambleHealth::TooShort;
         }
-        let chosen = self
-            .index
-            .best_match(&ladder(prompt), prompt.len())
-            .cloned();
+        let chosen = self.index.best_match(prompt).cloned();
         let health = match chosen {
             None => PreambleHealth::Missing,
             Some(entry) => {
@@ -1019,6 +1066,8 @@ mod tests {
             last_used,
             helper,
             checksum: None,
+            shape: None,
+            prefix: None,
         }
     }
 
@@ -1052,6 +1101,8 @@ mod tests {
             last_used: 1,
             helper: false,
             checksum: file_checksum(&dir.join(&file)),
+            shape: None,
+            prefix: Some(prefix_id(&prompt[..tokens])),
         }
     }
 
@@ -1203,6 +1254,69 @@ mod tests {
 
     /// A household's roles fill their own cap; the oldest helper goes, never a chat shape, even
     /// when the chat shape is older than every helper.
+    /// The prime and every role open with the same base prompt; only a shape's own next snapshot
+    /// may replace it, where one file per opening once kept the last shape compiled.
+    #[test]
+    fn shapes_sharing_an_opening_keep_a_snapshot_each() {
+        let a = shaped(7, 2000);
+        let mut b = a.clone();
+        b[1500] = LlamaToken(-3);
+        assert_ne!(
+            prefix_id(&a),
+            prefix_id(&b),
+            "a shared opening must not share a name"
+        );
+
+        let opening = ladder(&a);
+        let stranger = ladder(&shaped(9, 2000));
+        let named = |file: &str, shape: &str| IndexEntry {
+            ladder: opening.clone(),
+            shape: Some(shape.into()),
+            ..entry(file, 1, true)
+        };
+        let unnamed = |file: &str, ladder: &[(usize, u64)]| IndexEntry {
+            ladder: ladder.to_vec(),
+            ..entry(file, 1, false)
+        };
+        let mut index = SnapshotIndex::default();
+        for (file, shape) in [
+            ("prime.kv", "prime-typed"),
+            ("planner.kv", "role:planner"),
+            ("worker.kv", "role:worker"),
+        ] {
+            assert!(
+                index.admit(named(file, shape)).is_empty(),
+                "{shape} must not replace another shape"
+            );
+        }
+        assert!(
+            index.admit(unnamed("turn.kv", &opening)).is_empty(),
+            "a turn's own write must not replace a compiled shape"
+        );
+        assert!(index.admit(unnamed("elsewhere.kv", &stranger)).is_empty());
+        assert_eq!(
+            index.admit(named("planner-2.kv", "role:planner")),
+            vec!["planner.kv".to_string()],
+            "a shape's new snapshot replaces its old one"
+        );
+        assert_eq!(
+            index.admit(unnamed("turn-2.kv", &opening)),
+            vec!["turn.kv".to_string()],
+            "an unnamed write replaces the unnamed one opening the same way"
+        );
+        assert!(index.admit(unnamed("worker.kv", &opening)).is_empty());
+        let kept: Vec<(&str, Option<&str>)> = index
+            .entries
+            .iter()
+            .map(|e| (e.file.as_str(), e.shape.as_deref()))
+            .collect();
+        assert_eq!(kept.len(), 5, "{kept:?}");
+        assert!(
+            kept.contains(&("worker.kv", Some("role:worker"))),
+            "rewriting a shape's file keeps its shape: {kept:?}"
+        );
+    }
+
     #[test]
     fn helper_snapshots_evict_each_other_and_never_a_chat_shape() {
         let mut s = slot();
@@ -1322,6 +1436,8 @@ mod tests {
                     last_used: 1,
                     helper: false,
                     checksum: None,
+                    shape: None,
+                    prefix: None,
                 },
                 IndexEntry {
                     file: "deep.kv".into(),
@@ -1330,19 +1446,19 @@ mod tests {
                     last_used: 1,
                     helper: false,
                     checksum: None,
+                    shape: None,
+                    prefix: None,
                 },
             ],
         };
         // A longer prompt of the same shape: the deeper snapshot serves it.
-        let incoming = ladder(&shaped(1, 5000));
+        let incoming = shaped(1, 5000);
         assert_eq!(
-            index.best_match(&incoming, 5000).map(|e| e.file.as_str()),
+            index.best_match(&incoming).map(|e| e.file.as_str()),
             Some("deep.kv")
         );
         assert_eq!(
-            index
-                .best_match(&other_shape, 5000)
-                .map(|e| e.file.as_str()),
+            index.best_match(&shaped(2, 5000)).map(|e| e.file.as_str()),
             None,
             "a prompt shape with no stored cache must get nothing rather than the wrong one"
         );
@@ -1350,24 +1466,51 @@ mod tests {
         // The refusals that save a read. Each would otherwise cost tens to
         // hundreds of megabytes to discover.
         assert_eq!(
-            index.best_match(&incoming, 600).map(|e| e.file.as_str()),
+            index.best_match(&shaped(1, 600)).map(|e| e.file.as_str()),
             None,
             "a snapshot at least as long as the prompt leaves nothing to decode"
         );
         let diverges_early = {
             let mut p = shaped(1, 5000);
             p[700] = LlamaToken(-7);
-            ladder(&p)
+            p
         };
         assert_eq!(
-            index
-                .best_match(&diverges_early, 5000)
-                .map(|e| e.file.as_str()),
+            index.best_match(&diverges_early).map(|e| e.file.as_str()),
             Some("shallow.kv"),
             "the 4,000-token snapshot diverges from this prompt at token 700, so it cannot be \
              a prefix of it and must be refused FROM THE LADDER rather than by reading 4,000 \
              tokens of KV to find out -- while the 600-token one still genuinely is a prefix \
              and should be served"
+        );
+
+        // A role's deepest rung can sit inside the base every shape shares: only the whole
+        // prefix tells, and a wrong pick would be read, rejected and deleted.
+        let mut role = incoming[..1500].to_vec();
+        role[1200] = LlamaToken(-4);
+        let roles = SnapshotIndex {
+            entries: vec![IndexEntry {
+                tokens: role.len(),
+                ladder: ladder(&role),
+                prefix: Some(prefix_id(&role)),
+                ..entry("role.kv", 1, true)
+            }],
+        };
+        assert_eq!(
+            ladder_agreement(&roles.entries[0].ladder, &ladder(&incoming)),
+            1024,
+            "the ladder alone cannot tell this snapshot is another shape's"
+        );
+        assert!(
+            roles.best_match(&incoming).is_none(),
+            "another shape's snapshot must not be offered"
+        );
+        assert_eq!(
+            roles
+                .best_match(&[role.clone(), vec![LlamaToken(5); 40]].concat())
+                .map(|e| e.file.as_str()),
+            Some("role.kv"),
+            "its own shape still finds it"
         );
     }
 
