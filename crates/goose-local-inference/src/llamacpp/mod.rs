@@ -683,6 +683,7 @@ impl LocalInferenceBackend for LlamaCppBackend {
             prime_waiting: request.prime_waiting,
             suspended: &mut loaded.suspended,
             compile_prefill: request.compile_prefill,
+            prefill_retention_secs: request.prefill_retention_secs,
         };
 
         let result = if use_emulator {

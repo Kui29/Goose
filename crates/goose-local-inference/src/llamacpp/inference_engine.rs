@@ -110,6 +110,8 @@ pub(super) struct GenerationContext<'a> {
     pub suspended: &'a mut Option<SuspendedKv>,
     /// A prefill compile (`LocalGenerationRequest::compile_prefill`).
     pub compile_prefill: bool,
+    /// How long a helper snapshot may go unused before a compile discards it.
+    pub prefill_retention_secs: Option<u64>,
 }
 
 pub(super) struct LoadedModel {
@@ -1741,6 +1743,7 @@ fn prefill_prompt(
     prime_waiting: bool,
     suspended: &mut Option<SuspendedKv>,
     compile_prefill: bool,
+    prefill_retention_secs: Option<u64>,
 ) -> Result<PrefilledPrompt, ProviderError> {
     let n_ctx = u32::try_from(effective_ctx).map_err(|_| {
         ProviderError::ExecutionError(format!("Context size {effective_ctx} exceeds u32 range"))
@@ -1779,6 +1782,9 @@ fn prefill_prompt(
         // Judged on the cold path a real turn would take, never on a chat's resident cache.
         *session = None;
         if let Some(slot) = snapshot.as_mut() {
+            if let Some(secs) = prefill_retention_secs {
+                slot.retire_idle_helpers(secs);
+            }
             let health = slot.preamble_health(prompt);
             tracing::info!(
                 target: "giap::kv",
@@ -2469,6 +2475,7 @@ pub(super) fn prepare_generation(
             ctx.prime_waiting,
             ctx.suspended,
             ctx.compile_prefill,
+            ctx.prefill_retention_secs,
         )?;
         text_breakdown = Some((
             t_tok_done.duration_since(t_log_done).as_millis(),
@@ -3480,6 +3487,7 @@ pub(super) mod tests {
                 false,
                 &mut None,
                 false,
+                None,
             )
             .expect("prefill");
         }
@@ -3764,6 +3772,7 @@ pub(super) mod tests {
                     $prime_waiting,
                     &mut suspended,
                     false,
+                    None,
                 )
                 .expect("prefill")
                 .reused_prefix_tokens
@@ -3871,6 +3880,7 @@ pub(super) mod tests {
                     false,
                     &mut suspended,
                     $compile,
+                    None,
                 )
                 .expect("prefill")
                 .reused_prefix_tokens

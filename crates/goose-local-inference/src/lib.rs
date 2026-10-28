@@ -774,6 +774,8 @@ impl Provider for LocalInferenceProvider {
         let helper = goose_provider_types::request_context::is_helper();
         let prime_waiting = goose_provider_types::request_context::prime_is_waiting();
         let compile_prefill = goose_provider_types::request_context::is_compiling_prefill();
+        let prefill_retention_secs =
+            goose_provider_types::request_context::prefill_retention_secs();
         let temperature = model_config.temperature;
         // A compile only needs the prefill; one token proves the cache decodes.
         let max_tokens = if compile_prefill {
@@ -979,6 +981,7 @@ impl Provider for LocalInferenceProvider {
                     helper,
                     prime_waiting,
                     compile_prefill,
+                    prefill_retention_secs,
                 };
 
                 let result = backend.generate(loaded, request);

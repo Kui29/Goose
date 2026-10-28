@@ -47,6 +47,9 @@ pub(super) struct LocalGenerationRequest<'a> {
     pub prime_waiting: bool,
     /// A prefill compile (see `request_context::compiling_prefill`). LiteRT-LM ignores it.
     pub compile_prefill: bool,
+    /// Helper snapshots unused for longer are discarded by this compile
+    /// (see `request_context::compiling_prefill_retaining`).
+    pub prefill_retention_secs: Option<u64>,
 }
 
 pub(super) trait LocalInferenceBackend: Send + Sync {

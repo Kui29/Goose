@@ -830,6 +830,22 @@ impl SnapshotSlot {
         health
     }
 
+    /// Discards helper snapshots last used more than `max_idle_secs` ago: a role nobody runs any
+    /// more must not hold disk. Chat shapes are never aged out here.
+    pub(super) fn retire_idle_helpers(&mut self, max_idle_secs: u64) {
+        let cutoff = now_secs().saturating_sub(max_idle_secs);
+        let idle: Vec<String> = self
+            .index
+            .entries
+            .iter()
+            .filter(|e| e.helper && e.last_used < cutoff)
+            .map(|e| e.file.clone())
+            .collect();
+        for file in idle {
+            self.retire(&file, "a helper snapshot unused past its retention");
+        }
+    }
+
     fn record_checksum(&mut self, file: &str, checksum: u64) {
         if let Some(entry) = self.index.entries.iter_mut().find(|e| e.file == file) {
             entry.checksum = Some(checksum);
@@ -1053,6 +1069,42 @@ mod tests {
         assert!(
             s.index.entries[0].checksum.is_some(),
             "a file trusted once is summed, so a later change shows"
+        );
+    }
+
+    #[test]
+    fn an_idle_helper_snapshot_is_discarded_and_a_chat_shape_never_is() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut s, prompt) = compiled_slot(tmp.path());
+        let now = now_secs();
+        let day = 86_400;
+        let mut old_helper = stored(tmp.path(), &prompt, 1500, b"old role");
+        old_helper.helper = true;
+        old_helper.last_used = now - 20 * day;
+        let mut fresh_helper = stored(tmp.path(), &prompt, 1200, b"fresh role");
+        fresh_helper.helper = true;
+        fresh_helper.last_used = now - day;
+        let mut old_chat = stored(tmp.path(), &prompt, 1100, b"old chat");
+        old_chat.last_used = now - 20 * day;
+        s.index.entries = vec![old_helper.clone(), fresh_helper.clone(), old_chat.clone()];
+
+        s.retire_idle_helpers(14 * day);
+        let kept: Vec<&str> = s.index.entries.iter().map(|e| e.file.as_str()).collect();
+        assert!(
+            !kept.contains(&old_helper.file.as_str()),
+            "an idle role's snapshot must go"
+        );
+        assert!(
+            !tmp.path().join(&old_helper.file).exists(),
+            "and its file with it"
+        );
+        assert!(
+            kept.contains(&fresh_helper.file.as_str()),
+            "a role used yesterday stays"
+        );
+        assert!(
+            kept.contains(&old_chat.file.as_str()),
+            "chat shapes are kept by the shared cap, never aged out here"
         );
     }
 

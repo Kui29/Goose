@@ -8,6 +8,7 @@ tokio::task_local! {
     static HELPER: bool;
     static PRIME_WAITING: bool;
     static COMPILING_PREFILL: bool;
+    static PREFILL_RETENTION_SECS: Option<u64>;
 }
 
 /// Runs `f` as a call whose answer replaces the history of the conversation it is about, as a
@@ -80,6 +81,25 @@ pub async fn compiling_prefill<F: std::future::Future>(f: F) -> F::Output {
     COMPILING_PREFILL.scope(true, f).await
 }
 
+/// [`compiling_prefill`], which also discards helper snapshots unused for longer than
+/// `retention`, so an agent nobody runs stops holding disk.
+pub async fn compiling_prefill_retaining<F: std::future::Future>(
+    retention: std::time::Duration,
+    f: F,
+) -> F::Output {
+    COMPILING_PREFILL
+        .scope(
+            true,
+            PREFILL_RETENTION_SECS.scope(Some(retention.as_secs()), f),
+        )
+        .await
+}
+
+/// The retention a [`compiling_prefill_retaining`] call carries; `None` outside one.
+pub fn prefill_retention_secs() -> Option<u64> {
+    PREFILL_RETENTION_SECS.try_with(|secs| *secs).ok().flatten()
+}
+
 /// Whether the current call is [`compiling_prefill`]; `false` outside it.
 pub fn is_compiling_prefill() -> bool {
     COMPILING_PREFILL
@@ -128,6 +148,17 @@ mod tests {
         assert!(!is_compiling_prefill());
         assert!(compiling_prefill(async { is_compiling_prefill() }).await);
         assert!(!is_compiling_prefill(), "the scope ends with its future");
+        assert_eq!(
+            compiling_prefill(async { prefill_retention_secs() }).await,
+            None,
+            "a plain compile discards nothing"
+        );
+        let retained = compiling_prefill_retaining(std::time::Duration::from_secs(60), async {
+            (is_compiling_prefill(), prefill_retention_secs())
+        })
+        .await;
+        assert_eq!(retained, (true, Some(60)));
+        assert_eq!(prefill_retention_secs(), None);
     }
 
     #[tokio::test]

@@ -1853,6 +1853,7 @@ mod tests {
                         helper: false,
                         prime_waiting: false,
                         compile_prefill: false,
+                        prefill_retention_secs: None,
                     },
                 )
             });
