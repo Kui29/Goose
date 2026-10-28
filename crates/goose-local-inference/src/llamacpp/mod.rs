@@ -6,7 +6,7 @@ mod prompt_snapshot;
 
 use std::any::Any;
 use std::ffi::CStr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -209,6 +209,31 @@ fn missing_chat_template_error(
          llama.cpp built-in chat template name, configure a custom inline chat template containing \
          the full Jinja template source, or use a GGUF that includes tokenizer.chat_template metadata."
     ))
+}
+
+/// The drafter a request should attach to a model that has none: the one it names, unless that
+/// same path already failed for this model.
+fn drafter_to_attach<'a>(
+    has_draft: bool,
+    requested: Option<&'a Path>,
+    tried: Option<&Path>,
+) -> Option<&'a Path> {
+    requested.filter(|path| !has_draft && Some(*path) != tried)
+}
+
+/// The target's and the drafter's load parameters. mmap is explicit, because the default (`AUTO`)
+/// turns it off on an integrated GPU: on a Jetson Orin that copied the CPU-side tensors (Gemma's
+/// per-layer embeddings and token table, 1,872 MiB for E4B) into pinned host memory nothing can
+/// reclaim. Mapped, they are page cache, and a token reads only its own rows.
+fn model_params(settings: &crate::local_model_registry::ModelSettings) -> LlamaModelParams {
+    let mut params = LlamaModelParams::default().with_use_mmap(true);
+    if let Some(n_gpu_layers) = settings.n_gpu_layers {
+        params = params.with_n_gpu_layers(n_gpu_layers);
+    }
+    if settings.use_mlock {
+        params = params.with_use_mlock(true);
+    }
+    params
 }
 
 fn load_chat_templates(
@@ -415,6 +440,48 @@ impl LocalInferenceBackend for LlamaCppBackend {
         LLAMACPP_BACKEND_ID
     }
 
+    /// The MTP drafter at `path`. A drafter that fails to load degrades to no speculation rather
+    /// than failing the request: the target is what serves requests, and losing speed is not
+    /// losing service.
+    ///
+    /// CUDA builds only. Speculation pays where verifying a few drafts costs about one decode,
+    /// which is the Orin's CUDA path (2.1-2.3x in process); Metal re-runs its mat-vec kernel per
+    /// row up to a batch of 8 and measured 0.64-0.94x.
+    fn load_drafter(&self, path: &Path, params: &LlamaModelParams) -> Option<Arc<LlamaModel>> {
+        if !cfg!(feature = "cuda") {
+            tracing::debug!(
+                draft = %path.display(),
+                "MTP drafter ignored: speculation is enabled on CUDA builds only"
+            );
+            return None;
+        }
+        if !path.exists() {
+            tracing::warn!(
+                draft = %path.display(),
+                "MTP drafter not on disk; continuing without speculation"
+            );
+            return None;
+        }
+        match LlamaModel::load_from_file(&self.backend, path, params) {
+            Ok(d) => {
+                tracing::info!(
+                    backend = self.id(),
+                    draft = %path.display(),
+                    "MTP drafter loaded"
+                );
+                Some(Arc::new(d))
+            }
+            Err(e) => {
+                tracing::warn!(
+                    draft = %path.display(),
+                    error = %e,
+                    "MTP drafter failed to load; continuing without speculation"
+                );
+                None
+            }
+        }
+    }
+
     fn load_model(
         &self,
         model_id: &str,
@@ -438,66 +505,14 @@ impl LocalInferenceBackend for LlamaCppBackend {
             model_path.display()
         );
 
-        // Explicit, because the default (`AUTO`) turns mmap off on an integrated GPU: on a Jetson
-        // Orin that copied the CPU-side tensors (Gemma's per-layer embeddings and token table,
-        // 1,872 MiB for E4B) into pinned host memory nothing can reclaim. Mapped, they are page
-        // cache, and a token reads only its own rows.
-        let mut params = LlamaModelParams::default().with_use_mmap(true);
-        if let Some(n_gpu_layers) = settings.n_gpu_layers {
-            params = params.with_n_gpu_layers(n_gpu_layers);
-        }
-        if settings.use_mlock {
-            params = params.with_use_mlock(true);
-        }
+        let params = model_params(settings);
         let model = LlamaModel::load_from_file(&self.backend, model_path, &params)
             .map_err(|e| ProviderError::ExecutionError(e.to_string()))?;
 
-        // The MTP drafter, when the registry names one. A drafter that fails to
-        // load degrades to no speculation rather than failing the model load:
-        // the target is what serves requests, and losing speed is not losing
-        // service.
-        //
-        // CUDA builds only. Speculation pays where verifying a few drafts costs
-        // about one decode, which is the Orin's CUDA path (2.1-2.3x in process);
-        // Metal re-runs its mat-vec kernel per row up to a batch of 8 and
-        // measured 0.64-0.94x.
-        let draft_model = match resolved.draft_model_path.as_ref() {
-            Some(path) if !cfg!(feature = "cuda") => {
-                tracing::debug!(
-                    draft = %path.display(),
-                    "MTP drafter ignored: speculation is enabled on CUDA builds only"
-                );
-                None
-            }
-            Some(path) if path.exists() => {
-                match LlamaModel::load_from_file(&self.backend, path, &params) {
-                    Ok(d) => {
-                        tracing::info!(
-                            backend = self.id(),
-                            draft = %path.display(),
-                            "MTP drafter loaded"
-                        );
-                        Some(Arc::new(d))
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            draft = %path.display(),
-                            error = %e,
-                            "MTP drafter failed to load; continuing without speculation"
-                        );
-                        None
-                    }
-                }
-            }
-            Some(path) => {
-                tracing::warn!(
-                    draft = %path.display(),
-                    "MTP drafter not on disk; continuing without speculation"
-                );
-                None
-            }
-            None => None,
-        };
+        let draft_model = resolved
+            .draft_model_path
+            .as_deref()
+            .and_then(|path| self.load_drafter(path, &params));
 
         let templates = load_chat_templates(&model, settings)?;
 
@@ -513,6 +528,7 @@ impl LocalInferenceBackend for LlamaCppBackend {
         Ok(Box::new(LoadedModel {
             model: Arc::new(model),
             draft: draft_model,
+            draft_tried: resolved.draft_model_path.clone(),
             templates,
             mtmd_ctx,
             session: None,
@@ -533,6 +549,22 @@ impl LocalInferenceBackend for LlamaCppBackend {
             .ok_or_else(|| {
                 ProviderError::ExecutionError("Loaded model backend mismatch".to_string())
             })?;
+
+        // The pond attaches a drafter by writing it into the registry once its weights are on
+        // disk, which at boot can land after the first turn loaded the target; a model loaded
+        // without one would otherwise never speculate for the life of the process.
+        if let Some(path) = drafter_to_attach(
+            loaded.draft.is_some(),
+            request.draft_model_path.as_deref(),
+            loaded.draft_tried.as_deref(),
+        ) {
+            loaded.draft_tried = Some(path.to_path_buf());
+            if let Some(draft) = self.load_drafter(path, &model_params(request.settings)) {
+                loaded.draft = Some(draft);
+                // The retained context was built without the drafter; the next one is built with it.
+                loaded.session = None;
+            }
+        }
 
         let has_vision = request.resolved_model.mmproj_path.is_some();
         let marker = llama_cpp_2::mtmd::mtmd_default_marker();
@@ -777,6 +809,33 @@ fn log_inference_backend_devices() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_drafter_named_after_the_load_is_attached_once_and_a_failed_one_is_not_retried() {
+        let drafter = Path::new("/models/mtp-gemma-4-E4B-it.gguf");
+        assert_eq!(
+            drafter_to_attach(false, Some(drafter), None),
+            Some(drafter),
+            "the registry gained a drafter after the target loaded without one"
+        );
+        assert_eq!(
+            drafter_to_attach(false, Some(drafter), Some(drafter)),
+            None,
+            "the same path already failed for this model"
+        );
+        assert_eq!(
+            drafter_to_attach(true, Some(drafter), None),
+            None,
+            "it has one"
+        );
+        assert_eq!(drafter_to_attach(false, None, None), None, "none is named");
+        let other = Path::new("/models/mtp-gemma-4-E4B-it-v2.gguf");
+        assert_eq!(
+            drafter_to_attach(false, Some(other), Some(drafter)),
+            Some(other),
+            "a different drafter is worth a try"
+        );
+    }
 
     fn template_result(parser: Option<&str>, parse_tool_calls: bool) -> ChatTemplateResult {
         ChatTemplateResult {

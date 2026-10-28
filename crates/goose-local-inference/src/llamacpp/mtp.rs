@@ -185,7 +185,7 @@ pub fn speculate(
     n_past: i32,
     id_last: LlamaToken,
     prompt: &[LlamaToken],
-) -> Result<SpecStep, ProviderError> {
+) -> Result<Option<SpecStep>, ProviderError> {
     let t = std::time::Instant::now();
     let draft = mtp.draft(n_past, id_last, prompt)?;
     mtp.draft_us += t.elapsed().as_micros() as u64;
@@ -202,9 +202,25 @@ pub fn speculate(
             .map_err(|e| ProviderError::ExecutionError(format!("batch add: {e}")))?;
     }
     let t = std::time::Instant::now();
-    mtp.target_mut()
-        .decode(&mut batch)
-        .map_err(|e| ProviderError::ExecutionError(format!("speculative decode: {e}")))?;
+    match mtp.target_mut().decode(&mut batch) {
+        Ok(()) => {}
+        // The verify batch found no room in the cache. llama.cpp placed none of it, so the target
+        // still stands on `n_past`, and `None` tells the caller to go on without speculating.
+        Err(llama_cpp_2::DecodeError::NoKvCacheSlot) => {
+            tracing::warn!(
+                target: "giap::kv",
+                n_past,
+                batch = seq.len(),
+                "speculative verify found no cache slot; this turn continues without drafting"
+            );
+            return Ok(None);
+        }
+        Err(e) => {
+            return Err(ProviderError::ExecutionError(format!(
+                "speculative decode: {e}"
+            )))
+        }
+    }
     // Metal and CUDA return from `decode` before the graph has run, so without
     // this the target's forward pass is billed to whichever phase reads an
     // output first -- which made `verify` read 1.2 ms against a 37.7 ms plain
@@ -246,10 +262,10 @@ pub fn speculate(
     mtp.steps += 1;
 
     mtp.accept(n_acc)?;
-    Ok(SpecStep {
+    Ok(Some(SpecStep {
         tokens: accepted,
         next: (!model.is_eog_token(next)).then_some(next),
-    })
+    }))
 }
 
 #[cfg(test)]

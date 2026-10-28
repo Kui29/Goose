@@ -121,6 +121,9 @@ pub(super) struct LoadedModel {
     /// MTP drafter, loaded beside the target when the registry names one.
     /// `None` disables speculation entirely -- there is no partial mode.
     pub draft: Option<Arc<LlamaModel>>,
+    /// The drafter path last tried for this model, so one that fails to load is not retried on
+    /// every request.
+    pub draft_tried: Option<std::path::PathBuf>,
     pub templates: LoadedChatTemplates,
     /// Multimodal context for vision models. None for text-only models.
     pub mtmd_ctx: Option<MtmdContext>,
@@ -2667,7 +2670,7 @@ pub(super) fn generation_loop(
     // passes through with the prefill finished.
     // A media prompt's tokens are not all text, so a session a text turn left
     // with a drafter does not speculate on it.
-    let speculative = prompt_tokens.len() == prompt_token_count;
+    let mut speculative = prompt_tokens.len() == prompt_token_count;
     if let Some(mtp) = ctx.mtp_mut().filter(|_| speculative) {
         mtp.begin(prompt_tokens)?;
     }
@@ -2707,12 +2710,17 @@ pub(super) fn generation_loop(
         decoded.push(token);
         sequence.push(token);
 
-        if speculative && ctx.mtp_mut().is_some() {
+        let step = if speculative && ctx.mtp_mut().is_some() {
             let n_past = (sequence.len() - 1) as i32;
-            let step = {
-                let mtp = ctx.mtp_mut().expect("checked above");
-                super::mtp::speculate(mtp, model, &mut sampler, n_past, token, &sequence)?
-            };
+            let mtp = ctx.mtp_mut().expect("checked above");
+            let step = super::mtp::speculate(mtp, model, &mut sampler, n_past, token, &sequence)?;
+            // Without room for a draft this step, the rest of the turn decodes one token at a time.
+            speculative = step.is_some();
+            step
+        } else {
+            None
+        };
+        if let Some(step) = step {
             let mut stopped = false;
             for tok in step.tokens {
                 if (output_token_count as usize) >= max_output {
