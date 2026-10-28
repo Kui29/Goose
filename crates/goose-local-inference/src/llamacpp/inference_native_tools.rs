@@ -168,6 +168,9 @@ pub(super) fn generate_with_native_tools(
             }
         },
     )?;
+    let draft = draft_before
+        .zip(llama_ctx.mtp_mut().map(|m| m.counts()))
+        .map(|(before, after)| after.since(before, output_token_count.max(0) as usize));
 
     // The next turn's prompt embeds this reply, so folding the decoded tokens
     // into the retained sequence maximises the shared prefix. A sacrificial
@@ -269,9 +272,6 @@ pub(super) fn generate_with_native_tools(
         let _ = tx.blocking_send(Ok((Some(msg), None)));
     }
 
-    let draft = draft_before
-        .zip(llama_ctx.mtp_mut().map(|m| m.counts()))
-        .map(|(before, after)| after.since(before, output_token_count.max(0) as usize));
     let stats = goose_provider_types::conversation::token_usage::ProviderStats {
         time_to_first_token_ms: first_piece_at
             .map(|t| t.duration_since(generation_started).as_millis() as u64),
