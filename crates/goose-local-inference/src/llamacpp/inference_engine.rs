@@ -1932,6 +1932,36 @@ fn prefill_prompt(
         PrefillPlan::CreateContext | PrefillPlan::FullPrefillInPlace => {}
     }
 
+    // A compile rebuilding a preamble decodes exactly that far, saves it, then decodes the rest:
+    // once the whole prompt is in, a windowed cache keeps no checkpoint that far back.
+    if let (Some(keep), Some(slot)) = (rebuild_preamble, snapshot.as_mut()) {
+        if keep < prompt.len() {
+            full_prefill(
+                session,
+                draft,
+                model,
+                backend,
+                settings,
+                &prompt[..keep],
+                n_ctx,
+            )?;
+            let kv = session
+                .as_mut()
+                .expect("full_prefill leaves a session on success");
+            slot.write(kv.ctx.ctx(), &kv.tokens, class);
+            if let Err(e) = decode_checkpointed(kv, prompt, keep) {
+                *session = None;
+                return Err(e);
+            }
+            kv.tokens.extend_from_slice(&prompt[keep..]);
+            return Ok(PrefilledPrompt {
+                reused_prefix_tokens: 0,
+                transient: None,
+                effective_ctx,
+            });
+        }
+    }
+
     let retained = session.is_some();
     match full_prefill(session, draft, model, backend, settings, prompt, n_ctx) {
         Ok(()) => {}
