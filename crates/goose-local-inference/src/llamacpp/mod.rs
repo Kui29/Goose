@@ -383,6 +383,7 @@ impl LlamaCppBackend {
     fn load_drafter(&self, path: &Path, params: &LlamaModelParams) -> Option<Arc<LlamaModel>> {
         if !cfg!(feature = "cuda") {
             tracing::debug!(
+                target: "giap::kv",
                 draft = %path.display(),
                 "MTP drafter ignored: speculation is enabled on CUDA builds only"
             );
@@ -390,6 +391,7 @@ impl LlamaCppBackend {
         }
         if !path.exists() {
             tracing::warn!(
+                target: "giap::kv",
                 draft = %path.display(),
                 "MTP drafter not on disk; continuing without speculation"
             );
@@ -398,6 +400,7 @@ impl LlamaCppBackend {
         match LlamaModel::load_from_file(&self.backend, path, params) {
             Ok(d) => {
                 tracing::info!(
+                    target: "giap::kv",
                     backend = self.id(),
                     draft = %path.display(),
                     "MTP drafter loaded"
@@ -406,6 +409,7 @@ impl LlamaCppBackend {
             }
             Err(e) => {
                 tracing::warn!(
+                    target: "giap::kv",
                     draft = %path.display(),
                     error = %e,
                     "MTP drafter failed to load; continuing without speculation"

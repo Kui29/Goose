@@ -71,6 +71,7 @@ pub(super) fn generate_with_native_tools(
             .expect("prepare_generation retains a generation context")
             .session_ctx_mut(),
     };
+    let draft_before = llama_ctx.mtp_mut().map(|m| m.counts());
     let output_token_count = generation_loop(
         ctx.model,
         llama_ctx,
@@ -268,13 +269,16 @@ pub(super) fn generate_with_native_tools(
         let _ = tx.blocking_send(Ok((Some(msg), None)));
     }
 
+    let draft = draft_before
+        .zip(llama_ctx.mtp_mut().map(|m| m.counts()))
+        .map(|(before, after)| after.since(before, output_token_count.max(0) as usize));
     let stats = goose_provider_types::conversation::token_usage::ProviderStats {
         time_to_first_token_ms: first_piece_at
             .map(|t| t.duration_since(generation_started).as_millis() as u64),
         model_load_ms: ctx.model_load_ms,
         elapsed_ms: Some(generation_started.elapsed().as_millis() as u64),
         output_tokens: Some(output_token_count.max(0) as usize),
-        draft: None,
+        draft,
         prefill_ms: Some(prefill_ms),
         effective_context_tokens: Some(effective_ctx),
         reused_prefix_tokens: Some(reused_prefix_tokens),

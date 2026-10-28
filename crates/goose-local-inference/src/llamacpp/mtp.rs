@@ -32,6 +32,7 @@ use llama_cpp_2::model::LlamaModel;
 use llama_cpp_2::speculative::{MtpSpeculative, MtpSpeculativeParams};
 use llama_cpp_2::token::LlamaToken;
 
+use goose_provider_types::conversation::token_usage::DraftStats;
 use goose_provider_types::errors::ProviderError;
 
 /// A target context with an MTP drafter attached.
@@ -89,6 +90,14 @@ impl MtpSession {
             rollback_us: 0,
             steps: 0,
         })
+    }
+
+    pub fn counts(&self) -> DraftCounts {
+        DraftCounts {
+            drafted: self.drafted,
+            accepted: self.accepted,
+            steps: self.steps,
+        }
     }
 
     pub fn target(&self) -> &LlamaContext<'static> {
@@ -154,6 +163,34 @@ impl MtpSession {
         self.spec
             .accept(n_accepted as u16)
             .map_err(|e| ProviderError::ExecutionError(format!("MTP accept failed: {e}")))
+    }
+}
+
+/// A session's cumulative counters; a retained session spans turns, so a turn
+/// reports the difference between two readings.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DraftCounts {
+    drafted: u32,
+    accepted: u32,
+    steps: u32,
+}
+
+impl DraftCounts {
+    pub fn since(self, before: DraftCounts, emitted: usize) -> DraftStats {
+        let drafted = self.drafted.saturating_sub(before.drafted) as usize;
+        let accepted = self.accepted.saturating_sub(before.accepted) as usize;
+        DraftStats {
+            model: None,
+            draft_tokens: drafted,
+            accepted_tokens: accepted,
+            target_tokens: emitted,
+            rounds: self.steps.saturating_sub(before.steps) as usize,
+            accept_rate: if drafted == 0 {
+                0.0
+            } else {
+                accepted as f64 / drafted as f64
+            },
+        }
     }
 }
 
@@ -290,6 +327,32 @@ mod tests {
     use llama_cpp_2::model::params::LlamaModelParams;
     use llama_cpp_2::model::AddBos;
     use std::sync::Arc;
+
+    #[test]
+    fn a_turn_reports_only_its_own_drafts() {
+        let before = DraftCounts {
+            drafted: 40,
+            accepted: 30,
+            steps: 10,
+        };
+        let after = DraftCounts {
+            drafted: 60,
+            accepted: 45,
+            steps: 15,
+        };
+        let stats = after.since(before, 80);
+        assert_eq!(
+            (
+                stats.draft_tokens,
+                stats.accepted_tokens,
+                stats.rounds,
+                stats.target_tokens
+            ),
+            (20, 15, 5, 80)
+        );
+        assert!((stats.accept_rate - 0.75).abs() < 1e-9);
+        assert_eq!(after.since(after, 3).accept_rate, 0.0);
+    }
 
     /// What one speculative run cost, by phase.
     struct DraftReport {
