@@ -45,6 +45,8 @@ pub(super) struct LocalGenerationRequest<'a> {
     /// A live turn waits on this helper, so llama.cpp sets that turn's cache aside on disk until
     /// the turn continues, instead of rebuilding it afterwards.
     pub prime_waiting: bool,
+    /// A prefill compile (see `request_context::compiling_prefill`). LiteRT-LM ignores it.
+    pub compile_prefill: bool,
 }
 
 pub(super) trait LocalInferenceBackend: Send + Sync {

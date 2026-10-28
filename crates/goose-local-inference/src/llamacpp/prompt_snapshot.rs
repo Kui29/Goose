@@ -181,6 +181,27 @@ struct IndexEntry {
     /// Defaults to false so an index written before helper roles existed still reads.
     #[serde(default)]
     helper: bool,
+    /// FNV-1a of the file as written, so a compile can tell a corrupt file from a good one.
+    /// `None` for a file written before checksums; the first compile that trusts it records one.
+    #[serde(default)]
+    checksum: Option<u64>,
+}
+
+/// What a compile found for a prompt shape's snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PreambleHealth {
+    /// Only one prompt of this shape seen: the preamble is not known yet.
+    Unobserved,
+    /// The preamble is shorter than a snapshot is worth.
+    TooShort,
+    Valid,
+    Missing,
+    /// It covers a different stretch than the preamble the two prompts share.
+    Stale {
+        covers: usize,
+    },
+    /// Its bytes no longer match the checksum written beside it.
+    Corrupt,
 }
 
 /// The set of snapshots for one model, and which one a prompt should use.
@@ -592,6 +613,7 @@ impl SnapshotSlot {
                     ladder: rungs,
                     last_used: now_secs(),
                     helper: class == SnapshotClass::Helper,
+                    checksum: file_checksum(&final_path),
                 });
                 self.evict_beyond_cap();
                 self.save_index();
@@ -753,6 +775,68 @@ impl SnapshotSlot {
         }
     }
 
+    /// Judge the snapshot a real turn of `prompt`'s shape would restore, against the preamble two
+    /// compile prompts share. A file that fails is retired and the shape reopened for a write.
+    pub(super) fn preamble_health(&mut self, prompt: &[LlamaToken]) -> PreambleHealth {
+        let Some(bucket) = Self::bucket_of(prompt) else {
+            return PreambleHealth::TooShort;
+        };
+        let (stable, intersected) = match self.buckets.get(&bucket) {
+            Some(b) => (b.stable.as_ref().map_or(0, Vec::len), b.intersected),
+            None => (0, false),
+        };
+        if !intersected {
+            return PreambleHealth::Unobserved;
+        }
+        let preamble = stable.min(SNAPSHOT_MAX_TOKENS);
+        if preamble < SNAPSHOT_MIN_TOKENS {
+            return PreambleHealth::TooShort;
+        }
+        let chosen = self
+            .index
+            .best_match(&ladder(prompt), prompt.len())
+            .cloned();
+        let health = match chosen {
+            None => PreambleHealth::Missing,
+            Some(entry) => {
+                let path = self.dir.join(&entry.file);
+                match (file_checksum(&path), entry.checksum) {
+                    (None, _) => {
+                        self.forget(&entry.file, "index named a file that is gone");
+                        PreambleHealth::Missing
+                    }
+                    (Some(now), Some(written)) if now != written => {
+                        self.retire(&entry.file, "its bytes no longer match its checksum");
+                        PreambleHealth::Corrupt
+                    }
+                    (Some(now), recorded) => {
+                        if entry.tokens != preamble {
+                            self.retire(&entry.file, "it does not cover the preamble exactly");
+                            PreambleHealth::Stale {
+                                covers: entry.tokens,
+                            }
+                        } else {
+                            if recorded.is_none() {
+                                self.record_checksum(&entry.file, now);
+                            }
+                            PreambleHealth::Valid
+                        }
+                    }
+                }
+            }
+        };
+        // A valid file needs no write; anything else must be free to be rewritten this process.
+        self.buckets.entry(bucket).or_default().settled = health == PreambleHealth::Valid;
+        health
+    }
+
+    fn record_checksum(&mut self, file: &str, checksum: u64) {
+        if let Some(entry) = self.index.entries.iter_mut().find(|e| e.file == file) {
+            entry.checksum = Some(checksum);
+        }
+        self.save_index();
+    }
+
     /// Keep the newest `MAX_SNAPSHOTS` shared and `MAX_HELPER_SNAPSHOTS` helper snapshots,
     /// deleting the rest.
     fn evict_beyond_cap(&mut self) {
@@ -792,6 +876,32 @@ impl SnapshotSlot {
                 file = %victim,
                 "kv snapshot evicted"
             );
+        }
+    }
+}
+
+/// FNV-1a over a file's bytes in whole 1 MiB chunks; `None` when it cannot be read. Chunks are
+/// filled before hashing because `Fnv` mixes in each write's length, so a short read would change
+/// the sum.
+fn file_checksum(path: &Path) -> Option<u64> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut hash = Fnv::new();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let mut filled = 0;
+        while filled < buf.len() {
+            match file.read(&mut buf[filled..]).ok()? {
+                0 => break,
+                n => filled += n,
+            }
+        }
+        if filled == 0 {
+            return Some(hash.finish());
+        }
+        hash.write(&buf[..filled]);
+        if filled < buf.len() {
+            return Some(hash.finish());
         }
     }
 }
@@ -863,7 +973,121 @@ mod tests {
             ladder: Vec::new(),
             last_used,
             helper,
+            checksum: None,
         }
+    }
+
+    /// A slot in a real directory, having seen two prompts that share their first 1,500 tokens.
+    fn compiled_slot(dir: &Path) -> (SnapshotSlot, Vec<LlamaToken>) {
+        let mut s = SnapshotSlot::new(
+            dir.to_path_buf(),
+            SnapshotKey {
+                model_path: PathBuf::from("/m.gguf"),
+                model_len: 1,
+                model_mtime_secs: 2,
+                n_ctx: 4096,
+                layout: 0,
+            },
+        );
+        let a = shaped(7, 1600);
+        let mut b = a[..1500].to_vec();
+        b.extend(std::iter::repeat_n(LlamaToken(-5), 100));
+        s.observe(&a);
+        s.observe(&b);
+        (s, b)
+    }
+
+    fn stored(dir: &Path, prompt: &[LlamaToken], tokens: usize, bytes: &[u8]) -> IndexEntry {
+        let file = format!("covers-{tokens}.kv");
+        std::fs::write(dir.join(&file), bytes).unwrap();
+        IndexEntry {
+            file: file.clone(),
+            tokens,
+            ladder: ladder(&prompt[..tokens]),
+            last_used: 1,
+            helper: false,
+            checksum: file_checksum(&dir.join(&file)),
+        }
+    }
+
+    #[test]
+    fn a_compile_keeps_a_good_snapshot_and_reopens_every_kind_of_bad_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut s, prompt) = compiled_slot(tmp.path());
+        assert_eq!(s.preamble_health(&prompt), PreambleHealth::Missing);
+
+        let good = stored(tmp.path(), &prompt, 1500, b"kv bytes");
+        s.index.entries.push(good.clone());
+        assert_eq!(s.preamble_health(&prompt), PreambleHealth::Valid);
+        assert_eq!(
+            s.writable_prefix(&prompt),
+            None,
+            "a valid shape is not written again"
+        );
+
+        std::fs::write(tmp.path().join(&good.file), b"kv bytEs").unwrap();
+        assert_eq!(s.preamble_health(&prompt), PreambleHealth::Corrupt);
+        assert!(
+            !tmp.path().join(&good.file).exists(),
+            "a corrupt file is retired"
+        );
+        assert_eq!(
+            s.writable_prefix(&prompt),
+            Some(1500),
+            "and the shape is free to be written again"
+        );
+
+        s.index
+            .entries
+            .push(stored(tmp.path(), &prompt, 1200, b"older"));
+        assert_eq!(
+            s.preamble_health(&prompt),
+            PreambleHealth::Stale { covers: 1200 },
+            "a snapshot of an older, shorter preamble is not the preamble"
+        );
+
+        let mut unsummed = stored(tmp.path(), &prompt, 1500, b"from before checksums");
+        unsummed.checksum = None;
+        s.index.entries.push(unsummed);
+        assert_eq!(s.preamble_health(&prompt), PreambleHealth::Valid);
+        assert!(
+            s.index.entries[0].checksum.is_some(),
+            "a file trusted once is summed, so a later change shows"
+        );
+    }
+
+    #[test]
+    fn one_prompt_says_nothing_about_the_preamble() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = SnapshotSlot::new(
+            tmp.path().to_path_buf(),
+            SnapshotKey {
+                model_path: PathBuf::from("/m.gguf"),
+                model_len: 1,
+                model_mtime_secs: 2,
+                n_ctx: 4096,
+                layout: 0,
+            },
+        );
+        let a = shaped(7, 1600);
+        s.observe(&a);
+        assert_eq!(s.preamble_health(&a), PreambleHealth::Unobserved);
+    }
+
+    #[test]
+    fn a_checksum_is_the_same_however_the_file_is_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("big.kv");
+        std::fs::write(&path, vec![7u8; (1 << 20) * 2 + 13]).unwrap();
+        let once = file_checksum(&path);
+        assert!(once.is_some());
+        assert_eq!(file_checksum(&path), once);
+        std::fs::write(&path, vec![7u8; (1 << 20) * 2 + 14]).unwrap();
+        assert_ne!(
+            file_checksum(&path),
+            once,
+            "one more byte must change the sum"
+        );
     }
 
     /// A household's roles fill their own cap; the oldest helper goes, never a chat shape, even
@@ -986,6 +1210,7 @@ mod tests {
                     ladder: shallow_same_shape,
                     last_used: 1,
                     helper: false,
+                    checksum: None,
                 },
                 IndexEntry {
                     file: "deep.kv".into(),
@@ -993,6 +1218,7 @@ mod tests {
                     ladder: deep.clone(),
                     last_used: 1,
                     helper: false,
+                    checksum: None,
                 },
             ],
         };

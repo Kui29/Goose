@@ -108,6 +108,8 @@ pub(super) struct GenerationContext<'a> {
     pub prime_waiting: bool,
     /// The waiting turn's cache, set aside while a helper holds the context.
     pub suspended: &'a mut Option<SuspendedKv>,
+    /// A prefill compile (`LocalGenerationRequest::compile_prefill`).
+    pub compile_prefill: bool,
 }
 
 pub(super) struct LoadedModel {
@@ -1738,6 +1740,7 @@ fn prefill_prompt(
     helper: bool,
     prime_waiting: bool,
     suspended: &mut Option<SuspendedKv>,
+    compile_prefill: bool,
 ) -> Result<PrefilledPrompt, ProviderError> {
     let n_ctx = u32::try_from(effective_ctx).map_err(|_| {
         ProviderError::ExecutionError(format!("Context size {effective_ctx} exceeds u32 range"))
@@ -1771,6 +1774,20 @@ fn prefill_prompt(
     }
     if let Some(slot) = snapshot.as_mut() {
         slot.observe(prompt);
+    }
+    if compile_prefill {
+        // Judged on the cold path a real turn would take, never on a chat's resident cache.
+        *session = None;
+        if let Some(slot) = snapshot.as_mut() {
+            let health = slot.preamble_health(prompt);
+            tracing::info!(
+                target: "giap::kv",
+                event = "compiled",
+                verdict = ?health,
+                prompt_tokens = prompt.len(),
+                "prefill compile checked this shape's snapshot; a bad one is rebuilt below"
+            );
+        }
     }
 
     let class = if helper {
@@ -2451,6 +2468,7 @@ pub(super) fn prepare_generation(
             ctx.helper,
             ctx.prime_waiting,
             ctx.suspended,
+            ctx.compile_prefill,
         )?;
         text_breakdown = Some((
             t_tok_done.duration_since(t_log_done).as_millis(),
@@ -3461,6 +3479,7 @@ pub(super) mod tests {
                 false,
                 false,
                 &mut None,
+                false,
             )
             .expect("prefill");
         }
@@ -3744,6 +3763,7 @@ pub(super) mod tests {
                     $helper,
                     $prime_waiting,
                     &mut suspended,
+                    false,
                 )
                 .expect("prefill")
                 .reused_prefix_tokens
@@ -3795,6 +3815,112 @@ pub(super) mod tests {
         assert!(
             suspended.is_none(),
             "a helper nobody waits on must never put a conversation on disk"
+        );
+    }
+
+    /// Two compile calls of one shape build its missing snapshot, leave a good one untouched and
+    /// rebuild one whose bytes changed; a real turn afterwards restores the whole preamble.
+    #[test]
+    #[ignore = "requires a real GGUF on disk; run with --ignored"]
+    fn a_compile_builds_keeps_and_repairs_a_shapes_snapshot() {
+        use llama_cpp_2::model::AddBos;
+
+        let Some(live) = live_engine(8192) else {
+            eprintln!("skipping: no local GGUF found");
+            return;
+        };
+        let backend = shared_backend();
+        let preamble = filler(
+            &live.model,
+            "The pond keeps its own notes about the household and answers when asked. ",
+            1500,
+            AddBos::Always,
+        );
+        let with = |tail: &str| -> Vec<LlamaToken> {
+            let tail = filler(&live.model, tail, 40, AddBos::Never);
+            preamble.iter().chain(&tail).copied().collect()
+        };
+        let (first, second, real) = (
+            with("Alpha is the first of two compile calls. "),
+            with("Begin the second compile call here. "),
+            with("Today is Tuesday and the person asks about dinner. "),
+        );
+        assert_ne!(
+            first[preamble.len()],
+            second[preamble.len()],
+            "tails must differ at once"
+        );
+
+        let mut session = None;
+        let mut snapshot = None;
+        let mut suspended = None;
+        macro_rules! prefill {
+            ($prompt:expr, $compile:expr) => {
+                prefill_prompt(
+                    &mut session,
+                    live.draft.as_ref(),
+                    &mut snapshot,
+                    &live.model_path,
+                    &live.model,
+                    backend,
+                    &live.settings,
+                    $prompt,
+                    live.n_ctx as usize,
+                    false,
+                    false,
+                    false,
+                    &mut suspended,
+                    $compile,
+                )
+                .expect("prefill")
+                .reused_prefix_tokens
+            };
+        }
+        let files = |snapshot: &Option<crate::llamacpp::prompt_snapshot::SnapshotSlot>| {
+            snapshot
+                .as_ref()
+                .map_or_else(Vec::new, |s| s.snapshot_paths())
+        };
+
+        prefill!(&first, true);
+        prefill!(&second, true);
+        let built = files(&snapshot);
+        assert_eq!(
+            built.len(),
+            1,
+            "a compile of a shape with no snapshot must build one"
+        );
+        let path = built[0].clone();
+        let written_at = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        prefill!(&first, true);
+        prefill!(&second, true);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            written_at,
+            "a valid snapshot must be kept, not rewritten"
+        );
+
+        let mut bytes = std::fs::read(&path).unwrap();
+        let middle = bytes.len() / 2;
+        bytes[middle] ^= 0xff;
+        std::fs::write(&path, &bytes).unwrap();
+        prefill!(&first, true);
+        prefill!(&second, true);
+        let repaired = files(&snapshot);
+        assert_eq!(repaired.len(), 1, "a corrupt snapshot must be rebuilt");
+        assert_ne!(
+            std::fs::read(&repaired[0]).unwrap(),
+            bytes,
+            "the rebuilt snapshot must not be the corrupted bytes"
+        );
+
+        session = None;
+        let reused = prefill!(&real, false);
+        assert_eq!(
+            reused,
+            preamble.len(),
+            "a real turn of the shape must restore exactly the compiled preamble"
         );
     }
 

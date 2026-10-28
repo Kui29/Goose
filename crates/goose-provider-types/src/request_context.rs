@@ -7,6 +7,7 @@ tokio::task_local! {
     static TOOL_CALLS_ONLY: bool;
     static HELPER: bool;
     static PRIME_WAITING: bool;
+    static COMPILING_PREFILL: bool;
 }
 
 /// Runs `f` as a call whose answer replaces the history of the conversation it is about, as a
@@ -72,6 +73,20 @@ pub fn prime_is_waiting() -> bool {
     PRIME_WAITING.try_with(|waiting| *waiting).unwrap_or(false)
 }
 
+/// Runs `f` as a prefill compile: the provider prefills cold, checks the preamble snapshot it
+/// would restore against the one two compile calls of this shape share, rebuilds it when it is
+/// missing or bad, and generates at most one token.
+pub async fn compiling_prefill<F: std::future::Future>(f: F) -> F::Output {
+    COMPILING_PREFILL.scope(true, f).await
+}
+
+/// Whether the current call is [`compiling_prefill`]; `false` outside it.
+pub fn is_compiling_prefill() -> bool {
+    COMPILING_PREFILL
+        .try_with(|compiling| *compiling)
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -106,6 +121,13 @@ mod tests {
             "a background helper has no turn to set aside"
         );
         assert!(!prime_is_waiting());
+    }
+
+    #[tokio::test]
+    async fn only_a_call_made_inside_the_scope_compiles_a_prefill() {
+        assert!(!is_compiling_prefill());
+        assert!(compiling_prefill(async { is_compiling_prefill() }).await);
+        assert!(!is_compiling_prefill(), "the scope ends with its future");
     }
 
     #[tokio::test]

@@ -773,8 +773,14 @@ impl Provider for LocalInferenceProvider {
         let tool_calls_only = goose_provider_types::request_context::wants_tool_calls_only();
         let helper = goose_provider_types::request_context::is_helper();
         let prime_waiting = goose_provider_types::request_context::prime_is_waiting();
+        let compile_prefill = goose_provider_types::request_context::is_compiling_prefill();
         let temperature = model_config.temperature;
-        let max_tokens = model_config.max_tokens;
+        // A compile only needs the prefill; one token proves the cache decodes.
+        let max_tokens = if compile_prefill {
+            Some(1)
+        } else {
+            model_config.max_tokens
+        };
         let context_limit = model_context_limit;
         let settings = model_settings;
         let resolved_model = resolved.clone();
@@ -972,6 +978,7 @@ impl Provider for LocalInferenceProvider {
                     tool_calls_only,
                     helper,
                     prime_waiting,
+                    compile_prefill,
                 };
 
                 let result = backend.generate(loaded, request);
