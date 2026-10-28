@@ -102,6 +102,18 @@ pub(super) struct GenerationContext<'a> {
     pub one_shot: bool,
     /// Only a tool call from this generation is used (`LocalGenerationRequest::tool_calls_only`).
     pub tool_calls_only: bool,
+    /// A helper's call (`LocalGenerationRequest::helper`).
+    pub helper: bool,
+    /// A live turn waits on this helper (`LocalGenerationRequest::prime_waiting`).
+    pub prime_waiting: bool,
+    /// The waiting turn's cache, set aside while a helper holds the context.
+    pub suspended: &'a mut Option<SuspendedKv>,
+    /// The shape a prefill compile names (`LocalGenerationRequest::compile_prefill`).
+    pub compile_prefill: Option<String>,
+    /// How long a helper snapshot may go unused before a compile discards it.
+    pub prefill_retention_secs: Option<u64>,
+    /// The compile rebuilds even a valid snapshot (`LocalGenerationRequest::rebuild_prefill`).
+    pub rebuild_prefill: bool,
 }
 
 pub(super) struct LoadedModel {
@@ -119,6 +131,8 @@ pub(super) struct LoadedModel {
     /// key includes `n_ctx` and that is a property of the request rather than
     /// of the load.
     pub snapshot: Option<super::prompt_snapshot::SnapshotSlot>,
+    /// A waiting turn's cache on disk while a helper holds `session`; dropping it deletes the file.
+    pub suspended: Option<SuspendedKv>,
     /// Where this model was loaded from. Part of the snapshot key.
     pub model_path: std::path::PathBuf,
 }
@@ -331,8 +345,8 @@ pub(super) struct SessionKv {
     /// effective context of an incoming request; llama.cpp may round the
     /// realised `n_ctx` up, so the requested value is the stable identity.
     n_ctx: u32,
-    /// The last prefill into this cache was one-shot work, so nothing will
-    /// resume from it and it protects nothing (see `prefill_plan`).
+    /// The last prefill into this cache was one-shot work or a helper's, so it protects nothing:
+    /// at most that helper's own next turn resumes from it (see `prefill_plan`).
     one_shot: bool,
     /// When a generation last ran on this cache.
     last_used: std::time::Instant,
@@ -649,6 +663,175 @@ fn is_sacrificial_prompt(prompt_tokens: usize, cached_tokens: usize) -> bool {
 /// evicts it; another chat does once it has sat idle, or that chat's next turn prefills it all again.
 fn chat_cache_protected(prompt_is_chat: bool, idle: std::time::Duration) -> bool {
     !prompt_is_chat || idle < CHAT_CACHE_PROTECTED_FOR
+}
+
+/// A chat's cache set aside on disk while a helper holds the model's one context and the chat's
+/// turn waits on it. The file holds conversation, so dropping this deletes it.
+pub(super) struct SuspendedKv {
+    path: std::path::PathBuf,
+    tokens: Vec<LlamaToken>,
+    n_ctx: u32,
+    checkpoints: Vec<WindowCheckpoint>,
+}
+
+impl Drop for SuspendedKv {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+const SUSPEND_DIR: &str = "prompt-cache/suspended";
+
+static SUSPEND_LEFTOVERS_CLEARED: std::sync::Once = std::sync::Once::new();
+
+/// Deletes suspend files a crashed process left; once per process, before any is written.
+pub(super) fn clear_suspended_leftovers() {
+    SUSPEND_LEFTOVERS_CLEARED.call_once(|| {
+        let _ = std::fs::remove_dir_all(crate::paths::Paths::in_data_dir(SUSPEND_DIR));
+    });
+}
+
+/// The suspend directory, readable by the owner alone.
+fn suspend_dir() -> std::io::Result<std::path::PathBuf> {
+    clear_suspended_leftovers();
+    let dir = crate::paths::Paths::in_data_dir(SUSPEND_DIR);
+    std::fs::create_dir_all(&dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(dir)
+}
+
+/// Set the retained chat cache aside on disk before a helper takes the context. `None` leaves it
+/// in place, and the helper then evicts it as it would with no turn waiting.
+fn suspend_for_helper(session: &mut Option<SessionKv>) -> Option<SuspendedKv> {
+    let kv = session.as_ref()?;
+    // One-shot work and a picture's head are never resumed from, so they are not worth a file.
+    if kv.one_shot || kv.head.is_some() || kv.tokens.len() < REUSE_MIN_TOKENS {
+        return None;
+    }
+    let started = std::time::Instant::now();
+    let path = match suspend_dir() {
+        Ok(dir) => dir.join(format!("{}.kv", uuid::Uuid::new_v4())),
+        Err(e) => {
+            tracing::warn!(target: "giap::kv", event = "not_written", error = %e, "suspend directory unavailable; the helper evicts the chat cache");
+            return None;
+        }
+    };
+    let written = kv
+        .ctx
+        .ctx()
+        .state_seq_save_file(&path, 0, &kv.tokens)
+        .map_err(|e| e.to_string())
+        .and_then(|bytes| restrict_to_owner(&path).map(|()| bytes));
+    let bytes = match written {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            let _ = std::fs::remove_file(&path);
+            tracing::warn!(target: "giap::kv", event = "not_written", error = %e, "chat cache not suspended; the helper evicts it");
+            return None;
+        }
+    };
+    let SessionKv {
+        tokens,
+        n_ctx,
+        checkpoints,
+        ..
+    } = session.take()?;
+    tracing::info!(
+        target: "giap::kv",
+        event = "suspended",
+        tokens = tokens.len(),
+        bytes,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "chat cache set aside on disk while a helper holds the context"
+    );
+    Some(SuspendedKv {
+        path,
+        tokens,
+        n_ctx,
+        checkpoints,
+    })
+}
+
+fn restrict_to_owner(path: &std::path::Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| e.to_string())?;
+    }
+    let _ = path;
+    Ok(())
+}
+
+/// Bring a suspended chat cache back for the prompt that continues it, or delete it when this
+/// prompt does not. Either way the file is gone afterwards.
+#[allow(clippy::too_many_arguments)]
+fn resume_suspended(
+    session: &mut Option<SessionKv>,
+    suspended: &mut Option<SuspendedKv>,
+    draft: Option<&Arc<LlamaModel>>,
+    model: &Arc<LlamaModel>,
+    backend: &LlamaCppBackend,
+    settings: &ModelSettings,
+    prompt: &[LlamaToken],
+    n_ctx: u32,
+) {
+    let Some(mut held) = suspended.take() else {
+        return;
+    };
+    if held.n_ctx != n_ctx || common_prefix_len(&held.tokens, prompt) < REUSE_MIN_TOKENS {
+        tracing::info!(
+            target: "giap::kv",
+            event = "discarded",
+            reason = "the next chat prompt does not continue the suspended one",
+            "suspended chat cache deleted"
+        );
+        return;
+    }
+    let started = std::time::Instant::now();
+    // Released first, so two caches are never resident at once.
+    *session = None;
+    let mut kv = match SessionKv::create(model, draft, backend, n_ctx, settings) {
+        Ok(kv) => kv,
+        Err(e) => {
+            tracing::warn!(target: "giap::kv", event = "discarded", error = %e, "no context to resume the suspended chat cache into");
+            return;
+        }
+    };
+    match kv
+        .context_mut()
+        .state_seq_load_file(&held.path, 0, n_ctx as usize)
+    {
+        Ok((tokens, bytes)) if tokens == held.tokens => {
+            kv.tokens = std::mem::take(&mut held.tokens);
+            kv.checkpoints = std::mem::take(&mut held.checkpoints);
+            tracing::info!(
+                target: "giap::kv",
+                event = "resumed",
+                tokens = kv.tokens.len(),
+                bytes,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "suspended chat cache resumed; the turn continues from it"
+            );
+            *session = Some(kv);
+        }
+        Ok(_) => {
+            tracing::warn!(target: "giap::kv", event = "discarded", reason = "the file held other tokens", "suspended chat cache not resumed");
+        }
+        Err(e) => {
+            tracing::warn!(target: "giap::kv", event = "discarded", error = %e, "suspended chat cache could not be read");
+        }
+    }
+}
+
+/// Whether the retained cache is shielded from this prompt. A helper takes the one context: a
+/// second beside the prime's does not fit the device.
+fn retained_cache_protected(helper: bool, prompt_is_chat: bool, idle: std::time::Duration) -> bool {
+    !helper && chat_cache_protected(prompt_is_chat, idle)
 }
 
 /// Decide how to prefill a prompt whose plain-token part is `prompt`.
@@ -1466,6 +1649,9 @@ fn write_snapshot_if_due(
     snapshot: &mut Option<super::prompt_snapshot::SnapshotSlot>,
     prompt: &[LlamaToken],
     turn_was_cold: bool,
+    class: super::prompt_snapshot::SnapshotClass,
+    // A compile's shape and preamble, which a shared bucket's intersection may have shrunk below.
+    compiled: Option<(&str, usize)>,
 ) {
     // Writing is not free: measured 21.2 MiB in 314 ms, about 67 MiB/s, which is
     // ~1.6 s for a 6,000-token preamble on an 18 KiB/token model and ~5 s on a
@@ -1485,7 +1671,10 @@ fn write_snapshot_if_due(
     if kv.head.is_some() {
         return;
     }
-    let Some(keep) = slot.writable_prefix(prompt) else {
+    let Some(keep) = compiled
+        .map(|(_, keep)| keep)
+        .or_else(|| slot.writable_prefix(prompt))
+    else {
         return;
     };
     // The cache has to hold what is about to be written, and there has to be a
@@ -1525,7 +1714,12 @@ fn write_snapshot_if_due(
         }
         kv.tokens.extend_from_slice(&prompt[at..keep]);
     }
-    slot.write(kv.ctx.ctx(), &kv.tokens);
+    slot.write(
+        kv.ctx.ctx(),
+        &kv.tokens,
+        class,
+        compiled.map(|(shape, _)| shape),
+    );
 
     // Put the tail back: the turn still has to generate from the whole prompt.
     match decode_checkpointed(kv, prompt, keep) {
@@ -1557,10 +1751,33 @@ fn prefill_prompt(
     prompt: &[LlamaToken],
     effective_ctx: usize,
     one_shot: bool,
+    helper: bool,
+    prime_waiting: bool,
+    suspended: &mut Option<SuspendedKv>,
+    compile_prefill: Option<&str>,
+    prefill_retention_secs: Option<u64>,
+    rebuild_prefill: bool,
 ) -> Result<PrefilledPrompt, ProviderError> {
     let n_ctx = u32::try_from(effective_ctx).map_err(|_| {
         ProviderError::ExecutionError(format!("Context size {effective_ctx} exceeds u32 range"))
     })?;
+
+    if helper && prime_waiting {
+        if suspended.is_none() {
+            *suspended = suspend_for_helper(session);
+        }
+    } else if !helper && !one_shot {
+        resume_suspended(
+            session, suspended, draft, model, backend, settings, prompt, n_ctx,
+        );
+    } else if suspended.take().is_some() {
+        tracing::info!(
+            target: "giap::kv",
+            event = "discarded",
+            reason = "no waiting turn is left to continue it",
+            "suspended chat cache deleted"
+        );
+    }
 
     // The key includes `n_ctx`, which is a property of the request rather than of
     // the load, so the slot is built here and rebuilt whenever the window moves.
@@ -1574,7 +1791,45 @@ fn prefill_prompt(
     if let Some(slot) = snapshot.as_mut() {
         slot.observe(prompt);
     }
+    // Set when a compile found this shape's snapshot missing or bad: the cold path below writes it.
+    let mut rebuild_preamble: Option<usize> = None;
+    if let Some(shape) = compile_prefill {
+        // Judged on the cold path a real turn would take, never on a chat's resident cache.
+        *session = None;
+        if let Some(slot) = snapshot.as_mut() {
+            if let Some(secs) = prefill_retention_secs {
+                slot.retire_idle_helpers(secs);
+            }
+            let preamble = slot.compile_preamble(shape, prompt);
+            let health = match preamble {
+                None => super::prompt_snapshot::PreambleHealth::Unobserved,
+                Some(preamble) => slot.preamble_health_at(prompt, preamble, rebuild_prefill),
+            };
+            if matches!(
+                health,
+                super::prompt_snapshot::PreambleHealth::Missing
+                    | super::prompt_snapshot::PreambleHealth::Stale { .. }
+                    | super::prompt_snapshot::PreambleHealth::Corrupt
+            ) {
+                rebuild_preamble = preamble;
+            }
+            tracing::info!(
+                target: "giap::kv",
+                event = "compiled",
+                shape,
+                verdict = ?health,
+                preamble_tokens = preamble.unwrap_or(0),
+                prompt_tokens = prompt.len(),
+                "prefill compile checked this shape's snapshot; a bad one is rebuilt below"
+            );
+        }
+    }
 
+    let class = if helper {
+        super::prompt_snapshot::SnapshotClass::Helper
+    } else {
+        super::prompt_snapshot::SnapshotClass::Shared
+    };
     let plan = prefill_plan(
         session.as_ref().map(|kv| {
             // A text-only prompt carries no media, so it can never reproduce a
@@ -1584,7 +1839,8 @@ fn prefill_prompt(
             } else {
                 RetainedPrefix::resumable(kv)
             };
-            retained.worth_protecting &= chat_cache_protected(!one_shot, kv.last_used.elapsed());
+            retained.worth_protecting &=
+                retained_cache_protected(helper, !one_shot, kv.last_used.elapsed());
             retained
         }),
         prompt,
@@ -1630,7 +1886,7 @@ fn prefill_prompt(
             match reuse_prefix(kv, prompt, resume) {
                 Ok(resumed) => {
                     // Warm by definition: this turn reused a prefix.
-                    write_snapshot_if_due(session, snapshot, prompt, false);
+                    write_snapshot_if_due(session, snapshot, prompt, false, class, None);
                     return Ok(PrefilledPrompt {
                         reused_prefix_tokens: resumed,
                         transient: None,
@@ -1684,6 +1940,36 @@ fn prefill_prompt(
         PrefillPlan::CreateContext | PrefillPlan::FullPrefillInPlace => {}
     }
 
+    // A compile rebuilding a preamble decodes exactly that far, saves it, then decodes the rest:
+    // once the whole prompt is in, a windowed cache keeps no checkpoint that far back.
+    if let (Some(keep), Some(slot)) = (rebuild_preamble, snapshot.as_mut()) {
+        if keep < prompt.len() {
+            full_prefill(
+                session,
+                draft,
+                model,
+                backend,
+                settings,
+                &prompt[..keep],
+                n_ctx,
+            )?;
+            let kv = session
+                .as_mut()
+                .expect("full_prefill leaves a session on success");
+            slot.write(kv.ctx.ctx(), &kv.tokens, class, compile_prefill);
+            if let Err(e) = decode_checkpointed(kv, prompt, keep) {
+                *session = None;
+                return Err(e);
+            }
+            kv.tokens.extend_from_slice(&prompt[keep..]);
+            return Ok(PrefilledPrompt {
+                reused_prefix_tokens: 0,
+                transient: None,
+                effective_ctx,
+            });
+        }
+    }
+
     let retained = session.is_some();
     match full_prefill(session, draft, model, backend, settings, prompt, n_ctx) {
         Ok(()) => {}
@@ -1696,7 +1982,14 @@ fn prefill_prompt(
         Err(e) => return Err(e),
     }
     // Cold: this path decoded the whole prompt.
-    write_snapshot_if_due(session, snapshot, prompt, true);
+    write_snapshot_if_due(
+        session,
+        snapshot,
+        prompt,
+        true,
+        class,
+        compile_prefill.zip(rebuild_preamble),
+    );
     Ok(PrefilledPrompt {
         reused_prefix_tokens: 0,
         transient: None,
@@ -2244,6 +2537,12 @@ pub(super) fn prepare_generation(
             &tokens,
             ectx,
             ctx.one_shot,
+            ctx.helper,
+            ctx.prime_waiting,
+            ctx.suspended,
+            ctx.compile_prefill.as_deref(),
+            ctx.prefill_retention_secs,
+            ctx.rebuild_prefill,
         )?;
         text_breakdown = Some((
             t_tok_done.duration_since(t_log_done).as_millis(),
@@ -2266,7 +2565,7 @@ pub(super) fn prepare_generation(
         None => {
             if let Some(kv) = ctx.session.as_mut() {
                 kv.session_ctx_mut().ctx_mut().synchronize();
-                kv.one_shot = ctx.one_shot;
+                kv.one_shot = ctx.one_shot || ctx.helper;
                 kv.last_used = std::time::Instant::now();
                 // A rewind into this prompt's reply resumes at its end.
                 let tokens = std::mem::take(&mut kv.tokens);
@@ -2745,7 +3044,7 @@ pub(super) mod tests {
     #[test]
     #[ignore = "requires a real GGUF on disk; run with --ignored"]
     fn a_restored_snapshot_answers_identically_to_a_full_prefill() {
-        use crate::llamacpp::prompt_snapshot::SnapshotSlot;
+        use crate::llamacpp::prompt_snapshot::{SnapshotClass, SnapshotSlot};
         use llama_cpp_2::model::params::LlamaModelParams;
         use llama_cpp_2::model::AddBos;
 
@@ -2819,7 +3118,7 @@ pub(super) mod tests {
             kv.tokens.extend_from_slice(&prefix);
             let t = std::time::Instant::now();
             assert!(
-                slot.write(kv.ctx.ctx(), &kv.tokens),
+                slot.write(kv.ctx.ctx(), &kv.tokens, SnapshotClass::Shared, None),
                 "snapshot must be written"
             );
             eprintln!(
@@ -3251,6 +3550,12 @@ pub(super) mod tests {
                 prompt,
                 n_ctx,
                 false,
+                false,
+                false,
+                &mut None,
+                None,
+                None,
+                false,
             )
             .expect("prefill");
         }
@@ -3400,6 +3705,577 @@ pub(super) mod tests {
              cacheable run -- this is the lever that makes a disk cache work under \
              tool_selection_mode = relevant, where 30 distinct tool sets across 84 sessions \
              otherwise leave almost nothing in common"
+        );
+    }
+
+    /// A real model loaded the way the Orin's registry loads E4B, its files hard-linked into a
+    /// temp root that also holds every cache the engine writes. `GIAP_TEST_GGUF`,
+    /// `GIAP_TEST_DRAFT` and `GIAP_TEST_NCTX` override it.
+    struct LiveEngine {
+        model: Arc<LlamaModel>,
+        draft: Option<Arc<LlamaModel>>,
+        settings: ModelSettings,
+        model_path: std::path::PathBuf,
+        n_ctx: u32,
+        _env: env_lock::EnvGuard<'static>,
+        tmp: tempfile::TempDir,
+    }
+
+    fn live_engine(default_n_ctx: u32) -> Option<LiveEngine> {
+        use llama_cpp_2::model::params::LlamaModelParams;
+
+        let env_path = |name: &str| std::env::var_os(name).map(std::path::PathBuf::from);
+        let src = env_path("GIAP_TEST_GGUF").or_else(live_model_path)?;
+        let n_ctx = std::env::var("GIAP_TEST_NCTX")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default_n_ctx);
+        let tmp = tempfile::tempdir().expect("tempdir; set TMPDIR to the model's filesystem");
+        let link = |src: &std::path::Path, name: &str| {
+            let dst = tmp.path().join(name);
+            let real = std::fs::canonicalize(src).expect("resolve the model path");
+            std::fs::hard_link(&real, &dst).expect("hard link the model, never symlink it");
+            dst
+        };
+        let model_path = link(&src, "model.gguf");
+        let draft_path = env_path("GIAP_TEST_DRAFT").map(|d| link(&d, "draft.gguf"));
+        let env = env_lock::lock_env([("GOOSE_PATH_ROOT", Some(tmp.path().to_str().unwrap()))]);
+
+        let backend = shared_backend();
+        let params = LlamaModelParams::default().with_n_gpu_layers(99);
+        let load = |path: &std::path::Path| {
+            Arc::new(
+                LlamaModel::load_from_file(backend.llama_backend(), path, &params)
+                    .expect("load model"),
+            )
+        };
+        let model = load(&model_path);
+        let draft = draft_path.as_deref().map(load);
+        let settings = ModelSettings {
+            context_size: Some(n_ctx),
+            n_batch: Some(512),
+            n_ubatch: Some(512),
+            type_k: Some("f16".to_string()),
+            type_v: Some("f16".to_string()),
+            n_gpu_layers: Some(99),
+            flash_attention: Some(true),
+            n_threads: Some(4),
+            ..Default::default()
+        };
+        Some(LiveEngine {
+            model,
+            draft,
+            settings,
+            model_path,
+            n_ctx,
+            _env: env,
+            tmp,
+        })
+    }
+
+    /// Exactly `n` tokens of `sentence` repeated, so prompt lengths are what a test says.
+    fn filler(
+        model: &LlamaModel,
+        sentence: &str,
+        n: usize,
+        bos: llama_cpp_2::model::AddBos,
+    ) -> Vec<LlamaToken> {
+        let mut tokens = model
+            .str_to_token(&sentence.repeat(n / 4 + 8), bos)
+            .expect("tokenize");
+        assert!(tokens.len() >= n, "filler too short for {n} tokens");
+        tokens.truncate(n);
+        tokens
+    }
+
+    /// The suspend file exists only while a helper holds the context for a waiting turn; the
+    /// turn's next prompt resumes from it, and a helper nobody waits on never writes one.
+    #[test]
+    #[ignore = "requires a real GGUF on disk; run with --ignored"]
+    fn a_waiting_turn_resumes_from_its_suspend_file() {
+        use llama_cpp_2::model::AddBos;
+
+        let Some(live) = live_engine(8192) else {
+            eprintln!("skipping: no local GGUF found");
+            return;
+        };
+        let backend = shared_backend();
+        let prime = filler(
+            &live.model,
+            "The pond keeps its own notes about the household and answers when asked. ",
+            2500,
+            AddBos::Always,
+        );
+        let helper = filler(
+            &live.model,
+            "You are the pond's schedule helper: you read calendars and report back. ",
+            1200,
+            AddBos::Always,
+        );
+        let tail = filler(
+            &live.model,
+            " And then what happened next? ",
+            64,
+            AddBos::Never,
+        );
+        let continued: Vec<LlamaToken> = prime.iter().chain(&tail).copied().collect();
+
+        let mut session = None;
+        let mut snapshot = None;
+        let mut suspended = None;
+        macro_rules! prefill {
+            ($prompt:expr, $helper:expr, $prime_waiting:expr) => {
+                prefill_prompt(
+                    &mut session,
+                    live.draft.as_ref(),
+                    &mut snapshot,
+                    &live.model_path,
+                    &live.model,
+                    backend,
+                    &live.settings,
+                    $prompt,
+                    live.n_ctx as usize,
+                    false,
+                    $helper,
+                    $prime_waiting,
+                    &mut suspended,
+                    None,
+                    None,
+                    false,
+                )
+                .expect("prefill")
+                .reused_prefix_tokens
+            };
+        }
+
+        prefill!(&prime, false, false);
+        prefill!(&helper, true, true);
+        let path = suspended
+            .as_ref()
+            .expect("a waiting turn's cache must be set aside, not evicted")
+            .path
+            .clone();
+        assert!(
+            path.exists(),
+            "the suspend file must be on disk while the helper runs"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode =
+                |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode(&path),
+                0o600,
+                "the file holds conversation: owner only"
+            );
+            assert_eq!(mode(path.parent().unwrap()), 0o700);
+        }
+
+        let t = std::time::Instant::now();
+        let reused = prefill!(&continued, false, false);
+        eprintln!(
+            "resumed a {}-token turn in {} ms",
+            prime.len(),
+            t.elapsed().as_millis()
+        );
+        assert!(
+            suspended.is_none() && !path.exists(),
+            "a resumed turn leaves no file behind"
+        );
+        assert_eq!(
+            reused,
+            prime.len(),
+            "the continuing turn must reuse its whole suspended prefix, not rebuild it"
+        );
+
+        prefill!(&helper, true, false);
+        assert!(
+            suspended.is_none(),
+            "a helper nobody waits on must never put a conversation on disk"
+        );
+    }
+
+    /// Two compile calls of one shape build its missing snapshot, leave a good one untouched and
+    /// rebuild one whose bytes changed; a second shape opening the same way keeps its own beside it,
+    /// and a real turn of either restores its whole preamble.
+    #[test]
+    #[ignore = "requires a real GGUF on disk; run with --ignored"]
+    fn a_compile_builds_keeps_and_repairs_a_shapes_snapshot() {
+        use llama_cpp_2::model::AddBos;
+
+        let Some(live) = live_engine(8192) else {
+            eprintln!("skipping: no local GGUF found");
+            return;
+        };
+        let backend = shared_backend();
+        let preamble = filler(
+            &live.model,
+            "The pond keeps its own notes about the household and answers when asked. ",
+            1500,
+            AddBos::Always,
+        );
+        let with = |tail: &str| -> Vec<LlamaToken> {
+            let tail = filler(&live.model, tail, 40, AddBos::Never);
+            preamble.iter().chain(&tail).copied().collect()
+        };
+        let (first, second, real) = (
+            with("Alpha is the first of two compile calls. "),
+            with("Begin the second compile call here. "),
+            with("Today is Tuesday and the person asks about dinner. "),
+        );
+        assert_ne!(
+            first[preamble.len()],
+            second[preamble.len()],
+            "tails must differ at once"
+        );
+
+        let mut session = None;
+        let mut snapshot = None;
+        let mut suspended = None;
+        macro_rules! prefill {
+            ($prompt:expr, $compile:expr) => {
+                prefill_prompt(
+                    &mut session,
+                    live.draft.as_ref(),
+                    &mut snapshot,
+                    &live.model_path,
+                    &live.model,
+                    backend,
+                    &live.settings,
+                    $prompt,
+                    live.n_ctx as usize,
+                    false,
+                    false,
+                    false,
+                    &mut suspended,
+                    $compile,
+                    None,
+                    false,
+                )
+                .expect("prefill")
+                .reused_prefix_tokens
+            };
+        }
+        let files = |snapshot: &Option<crate::llamacpp::prompt_snapshot::SnapshotSlot>| {
+            snapshot
+                .as_ref()
+                .map_or_else(Vec::new, |s| s.snapshot_paths())
+        };
+
+        prefill!(&first, Some("test-shape"));
+        prefill!(&second, Some("test-shape"));
+        let built = files(&snapshot);
+        assert_eq!(
+            built.len(),
+            1,
+            "a compile of a shape with no snapshot must build one"
+        );
+        let path = built[0].clone();
+        let written_at = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        prefill!(&first, Some("test-shape"));
+        prefill!(&second, Some("test-shape"));
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            written_at,
+            "a valid snapshot must be kept, not rewritten"
+        );
+
+        let mut bytes = std::fs::read(&path).unwrap();
+        let middle = bytes.len() / 2;
+        bytes[middle] ^= 0xff;
+        std::fs::write(&path, &bytes).unwrap();
+        prefill!(&first, Some("test-shape"));
+        prefill!(&second, Some("test-shape"));
+        let repaired = files(&snapshot);
+        assert_eq!(repaired.len(), 1, "a corrupt snapshot must be rebuilt");
+        assert_ne!(
+            std::fs::read(&repaired[0]).unwrap(),
+            bytes,
+            "the rebuilt snapshot must not be the corrupted bytes"
+        );
+
+        let other: Vec<LlamaToken> = preamble[..600]
+            .iter()
+            .copied()
+            .chain(filler(
+                &live.model,
+                "A helper reads one step of a task and writes what it found. ",
+                1000,
+                AddBos::Never,
+            ))
+            .collect();
+        let other_with = |tail: &str| -> Vec<LlamaToken> {
+            let tail = filler(&live.model, tail, 40, AddBos::Never);
+            other.iter().chain(&tail).copied().collect()
+        };
+        prefill!(
+            &other_with("Alpha is the first of two compile calls. "),
+            Some("other-shape")
+        );
+        prefill!(
+            &other_with("Begin the second compile call here. "),
+            Some("other-shape")
+        );
+        assert_eq!(
+            files(&snapshot).len(),
+            2,
+            "a shape opening as another does must keep its own snapshot beside it"
+        );
+
+        session = None;
+        let reused = prefill!(&real, None);
+        assert_eq!(
+            reused,
+            preamble.len(),
+            "a real turn of the shape must restore exactly the compiled preamble"
+        );
+        session = None;
+        let reused = prefill!(
+            &other_with("A step asks what the household eats on Tuesdays. "),
+            None
+        );
+        assert_eq!(
+            reused,
+            other.len(),
+            "a real turn of the second shape must restore its own preamble"
+        );
+    }
+
+    /// A helper turn beside the prime (a throwaway context) against handing it the one context and
+    /// rebuilding the prime from its preamble snapshot or a suspend file. Stop the pond first.
+    #[test]
+    #[ignore = "requires a real GGUF on disk; run with --ignored"]
+    fn what_a_helper_turn_costs_the_prime() {
+        use crate::llamacpp::prompt_snapshot::{SnapshotClass, SnapshotSlot};
+        use llama_cpp_2::model::AddBos;
+        use std::time::Instant;
+
+        let env_num = |name: &str, default: usize| {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default)
+        };
+        let Some(live) = live_engine(16384) else {
+            eprintln!("skipping: no local GGUF found");
+            return;
+        };
+        let (model, draft, settings, model_path, tmp) = (
+            &live.model,
+            &live.draft,
+            &live.settings,
+            &live.model_path,
+            &live.tmp,
+        );
+        let n_ctx = live.n_ctx;
+        let backend = shared_backend();
+        let preamble_len = env_num("GIAP_TEST_PREAMBLE", 3000);
+        let role_len = env_num("GIAP_TEST_ROLE", 1100);
+        let task_len = 300;
+        let text = |sentence: &str, n: usize, bos: AddBos| filler(model, sentence, n, bos);
+        let preamble = text(
+            "The pond keeps its own notes about the household and answers when asked. ",
+            preamble_len,
+            AddBos::Always,
+        );
+        let role = text(
+            "You are the pond's schedule helper: you read calendars and report back. ",
+            role_len,
+            AddBos::Always,
+        );
+        let task = text(
+            "Find a free hour on Saturday for the two of them and say why it fits. ",
+            task_len,
+            AddBos::Never,
+        );
+        let helper: Vec<LlamaToken> = role.iter().chain(&task).copied().collect();
+        let probe = model
+            .str_to_token(" So the answer is", AddBos::Never)
+            .expect("tokenize probe")[0];
+
+        let mem_available_mib = || -> Option<i64> {
+            let info = std::fs::read_to_string("/proc/meminfo").ok()?;
+            let kb = info.lines().find_map(|l| l.strip_prefix("MemAvailable:"))?;
+            kb.trim()
+                .trim_end_matches("kB")
+                .trim()
+                .parse::<i64>()
+                .ok()
+                .map(|kb| kb / 1024)
+        };
+        let taken = |before: Option<i64>| {
+            before
+                .zip(mem_available_mib())
+                .map_or("n/a".to_string(), |(b, a)| format!("{} MiB", b - a))
+        };
+        let ms = |t: Instant| t.elapsed().as_millis();
+        let answer_after_probe = |kv: &mut SessionKv, pos: usize| {
+            decode_tokens(kv.ctx.ctx_mut(), &[probe], pos).expect("decode probe");
+            kv.ctx
+                .ctx_mut()
+                .get_logits_ith(0)
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map(|(i, _)| i)
+                .expect("logits")
+        };
+
+        let mut slot =
+            SnapshotSlot::for_model(&model_path, n_ctx, &settings).expect("slot for a real model");
+        for (name, tokens, class) in [
+            ("prime preamble", &preamble, SnapshotClass::Shared),
+            ("role preamble", &role, SnapshotClass::Helper),
+        ] {
+            let mut kv =
+                SessionKv::create(&model, draft.as_ref(), backend, n_ctx, &settings).expect("ctx");
+            decode_tokens(kv.ctx.ctx_mut(), tokens, 0).expect("prefill preamble");
+            let t = Instant::now();
+            assert!(
+                slot.write(kv.ctx.ctx(), tokens, class, None),
+                "{name} snapshot must be written"
+            );
+            eprintln!("{name}: {} tokens saved in {} ms", tokens.len(), ms(t));
+        }
+
+        let mut disagreements = Vec::new();
+        for history_len in [2048usize, 4096, 8192] {
+            let history = text(
+                "Earlier the family talked about the garden, the school run and dinner. ",
+                history_len,
+                AddBos::Never,
+            );
+            let prime: Vec<LlamaToken> = preamble.iter().chain(&history).copied().collect();
+            if prime.len() + 1 > n_ctx as usize {
+                eprintln!("history {history_len}: does not fit n_ctx {n_ctx}, skipped");
+                continue;
+            }
+            let suspend_path = tmp.path().join(format!("prime-{history_len}.kv"));
+
+            let mut session: Option<SessionKv> = None;
+            let before = mem_available_mib();
+            let t = Instant::now();
+            full_prefill(
+                &mut session,
+                draft.as_ref(),
+                &model,
+                backend,
+                &settings,
+                &prime,
+                n_ctx,
+            )
+            .expect("cold prime");
+            let cold_ms = ms(t);
+            let prime_mem = taken(before);
+
+            let t = Instant::now();
+            let suspend_bytes = session
+                .as_ref()
+                .expect("prime")
+                .ctx
+                .ctx()
+                .state_seq_save_file(&suspend_path, 0, &prime)
+                .expect("suspend the prime");
+            let suspend_ms = ms(t);
+            let cold_answer = answer_after_probe(session.as_mut().expect("prime"), prime.len());
+
+            let before = mem_available_mib();
+            let t = Instant::now();
+            let side_n_ctx =
+                sacrificial_context_size(helper.len(), settings.max_output_tokens, n_ctx);
+            let side = sacrificial_prefill(
+                &model,
+                draft.as_ref(),
+                backend,
+                &settings,
+                &helper,
+                side_n_ctx,
+            );
+            let side_ms = ms(t);
+            let side_mem = taken(before);
+            let side_ok = side.is_ok();
+            drop(side);
+
+            let helper_in = |session: &mut Option<SessionKv>, slot: &mut SnapshotSlot| {
+                let t = Instant::now();
+                let restored = seed_from_snapshot(
+                    session,
+                    draft.as_ref(),
+                    &model,
+                    backend,
+                    &settings,
+                    slot,
+                    &helper,
+                    n_ctx,
+                )
+                .expect("helper seed");
+                assert_eq!(
+                    restored,
+                    Some(role.len()),
+                    "the role snapshot must seed the helper"
+                );
+                ms(t)
+            };
+
+            let helper_seed_ms = helper_in(&mut session, &mut slot);
+            let t = Instant::now();
+            session = None;
+            let mut kv =
+                SessionKv::create(&model, draft.as_ref(), backend, n_ctx, &settings).expect("ctx");
+            let (tokens, _) = kv
+                .context_mut()
+                .state_seq_load_file(&suspend_path, 0, n_ctx as usize)
+                .expect("resume the suspended prime");
+            let resume_ms = ms(t);
+            assert_eq!(
+                tokens.len(),
+                prime.len(),
+                "the suspend file must hold the whole prime"
+            );
+            let resumed_answer = answer_after_probe(&mut kv, prime.len());
+            session = Some(kv);
+
+            helper_in(&mut session, &mut slot);
+            let t = Instant::now();
+            let restored = seed_from_snapshot(
+                &mut session,
+                draft.as_ref(),
+                &model,
+                backend,
+                &settings,
+                &mut slot,
+                &prime,
+                n_ctx,
+            )
+            .expect("rebuild the prime");
+            let rebuild_ms = ms(t);
+            assert_eq!(
+                restored,
+                Some(preamble.len()),
+                "the preamble snapshot must seed the prime"
+            );
+            let rebuilt_answer = answer_after_probe(session.as_mut().expect("prime"), prime.len());
+            drop(session);
+            let _ = std::fs::remove_file(&suspend_path);
+
+            eprintln!(
+                "history {history_len} (prime {} tok): cold {cold_ms} ms, context {prime_mem} | \
+                 side context ({side_n_ctx}): {} {side_ms} ms, {side_mem} | helper seeded {helper_seed_ms} ms | \
+                 prime rebuilt {rebuild_ms} ms | suspend {suspend_ms} ms, {:.0} MiB, resume {resume_ms} ms",
+                prime.len(),
+                if side_ok { "ok" } else { "FAILED" },
+                suspend_bytes as f64 / 1_048_576.0,
+            );
+            if rebuilt_answer != cold_answer || resumed_answer != cold_answer {
+                disagreements.push((history_len, cold_answer, rebuilt_answer, resumed_answer));
+            }
+        }
+        assert!(
+            disagreements.is_empty(),
+            "a rebuilt or resumed prime predicted a different next token than the cold one \
+             (history, cold, rebuilt, resumed): {disagreements:?}"
         );
     }
 
@@ -3925,6 +4801,16 @@ pub(super) mod tests {
             prefill_plan(Some(retained(&leftover, 16_384)), &chat_turn, 16_384),
             PrefillPlan::SacrificialContext,
             "a chat's cache of that size is still protected"
+        );
+    }
+
+    #[test]
+    fn a_helper_is_never_kept_out_of_the_one_context() {
+        let now = std::time::Duration::ZERO;
+        assert!(!retained_cache_protected(true, true, now));
+        assert!(
+            retained_cache_protected(false, true, now),
+            "a chat turn must still be shielded, or the helper case proves nothing"
         );
     }
 

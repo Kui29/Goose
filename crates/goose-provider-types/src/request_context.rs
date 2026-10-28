@@ -5,6 +5,11 @@ tokio::task_local! {
     static REPLACES_HISTORY: bool;
     static SESSION: Option<String>;
     static TOOL_CALLS_ONLY: bool;
+    static HELPER: bool;
+    static PRIME_WAITING: bool;
+    static COMPILING_PREFILL: Option<String>;
+    static PREFILL_RETENTION_SECS: Option<u64>;
+    static PREFILL_REBUILD: bool;
 }
 
 /// Runs `f` as a call whose answer replaces the history of the conversation it is about, as a
@@ -50,6 +55,88 @@ pub fn wants_tool_calls_only() -> bool {
     TOOL_CALLS_ONLY.try_with(|only| *only).unwrap_or(false)
 }
 
+/// Runs `f` as a call made for a helper agent. A provider keeping one context per model hands it
+/// that context, since the device cannot hold a second beside it. `prime_waiting` says a live turn
+/// waits on the helper, so its cache may be set aside rather than lost.
+pub async fn as_helper<F: std::future::Future>(prime_waiting: bool, f: F) -> F::Output {
+    HELPER
+        .scope(true, PRIME_WAITING.scope(prime_waiting, f))
+        .await
+}
+
+/// Whether the current call is [`as_helper`]; `false` outside it. Read it before handing work to
+/// another task.
+pub fn is_helper() -> bool {
+    HELPER.try_with(|helper| *helper).unwrap_or(false)
+}
+
+/// Whether a live turn waits on the current helper call; `false` outside [`as_helper`].
+pub fn prime_is_waiting() -> bool {
+    PRIME_WAITING.try_with(|waiting| *waiting).unwrap_or(false)
+}
+
+/// Runs `f` as a prefill compile of the prompt shape named `shape`: the provider prefills cold,
+/// learns the preamble from what two compile calls of that shape share, keeps a snapshot that
+/// holds exactly it, rebuilds one that is missing or bad, and generates at most one token. The
+/// name, not the prompt, says which calls pair up: many shapes open with the same base prompt.
+pub async fn compiling_prefill<F: std::future::Future>(
+    shape: impl Into<String>,
+    f: F,
+) -> F::Output {
+    COMPILING_PREFILL.scope(Some(shape.into()), f).await
+}
+
+/// [`compiling_prefill`], which also discards helper snapshots unused for longer than
+/// `retention`, so an agent nobody runs stops holding disk.
+pub async fn compiling_prefill_retaining<F: std::future::Future>(
+    shape: impl Into<String>,
+    retention: std::time::Duration,
+    f: F,
+) -> F::Output {
+    COMPILING_PREFILL
+        .scope(
+            Some(shape.into()),
+            PREFILL_RETENTION_SECS.scope(Some(retention.as_secs()), f),
+        )
+        .await
+}
+
+/// The retention a [`compiling_prefill_retaining`] call carries; `None` outside one.
+pub fn prefill_retention_secs() -> Option<u64> {
+    PREFILL_RETENTION_SECS.try_with(|secs| *secs).ok().flatten()
+}
+
+/// [`compiling_prefill`] that rebuilds the shape's snapshot even when it is valid: a member
+/// asked for its cache to be invalidated.
+pub async fn rebuilding_prefill<F: std::future::Future>(
+    shape: impl Into<String>,
+    f: F,
+) -> F::Output {
+    COMPILING_PREFILL
+        .scope(Some(shape.into()), PREFILL_REBUILD.scope(true, f))
+        .await
+}
+
+/// Whether the current compile is [`rebuilding_prefill`]; `false` outside it.
+pub fn is_rebuilding_prefill() -> bool {
+    PREFILL_REBUILD
+        .try_with(|rebuild| *rebuild)
+        .unwrap_or(false)
+}
+
+/// The shape the current [`compiling_prefill`] call compiles; `None` outside one.
+pub fn compiling_prefill_shape() -> Option<String> {
+    COMPILING_PREFILL
+        .try_with(|shape| shape.clone())
+        .ok()
+        .flatten()
+}
+
+/// Whether the current call is [`compiling_prefill`]; `false` outside it.
+pub fn is_compiling_prefill() -> bool {
+    compiling_prefill_shape().is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -68,6 +155,52 @@ mod tests {
                 .await
                 .unwrap();
         assert!(!inherited, "read it before spawning");
+    }
+
+    #[tokio::test]
+    async fn only_a_call_made_inside_the_scope_is_a_helper() {
+        assert!(!is_helper());
+        assert!(as_helper(false, async { is_helper() }).await);
+        assert!(!is_helper(), "the scope ends with its future");
+        assert!(
+            as_helper(true, async { prime_is_waiting() }).await,
+            "a helper a turn waits on says so"
+        );
+        assert!(
+            !as_helper(false, async { prime_is_waiting() }).await,
+            "a background helper has no turn to set aside"
+        );
+        assert!(!prime_is_waiting());
+    }
+
+    #[tokio::test]
+    async fn only_a_call_made_inside_the_scope_compiles_a_prefill() {
+        assert!(!is_compiling_prefill());
+        assert_eq!(
+            compiling_prefill("role:planner", async { compiling_prefill_shape() }).await,
+            Some("role:planner".to_string())
+        );
+        assert!(!is_compiling_prefill(), "the scope ends with its future");
+        assert_eq!(
+            compiling_prefill("prime-typed", async { prefill_retention_secs() }).await,
+            None,
+            "a plain compile discards nothing"
+        );
+        let retained =
+            compiling_prefill_retaining("role:worker", std::time::Duration::from_secs(60), async {
+                (is_compiling_prefill(), prefill_retention_secs())
+            })
+            .await;
+        assert_eq!(retained, (true, Some(60)));
+        assert!(!compiling_prefill("role:worker", async { is_rebuilding_prefill() }).await);
+        assert!(
+            rebuilding_prefill("role:worker", async {
+                is_rebuilding_prefill() && is_compiling_prefill()
+            })
+            .await,
+            "a rebuild is a compile that does not keep a valid snapshot"
+        );
+        assert_eq!(prefill_retention_secs(), None);
     }
 
     #[tokio::test]

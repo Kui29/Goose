@@ -1850,6 +1850,11 @@ mod tests {
                         replaces_history: false,
                         session_id: None,
                         tool_calls_only: false,
+                        helper: false,
+                        prime_waiting: false,
+                        compile_prefill: None,
+                        prefill_retention_secs: None,
+                        rebuild_prefill: false,
                     },
                 )
             });

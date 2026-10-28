@@ -120,6 +120,17 @@ const LADDER_DEPTHS: &[usize] = &[256, 512, 1024, 2048, 4096, 8192, 16384];
 /// snapshot is ~70 MiB, so six is the difference between a cache and a problem.
 const MAX_SNAPSHOTS: usize = 6;
 
+/// How many helper-role snapshots the same key may keep beside those, so a household's saved
+/// roles never evict its own chat shapes.
+const MAX_HELPER_SNAPSHOTS: usize = 6;
+
+/// Which cap a snapshot counts against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SnapshotClass {
+    Shared,
+    Helper,
+}
+
 /// How stale a `last_used` stamp may get before the index is rewritten.
 const TOUCH_WRITE_INTERVAL_SECS: u64 = 3600;
 
@@ -167,6 +178,37 @@ struct IndexEntry {
     /// Seconds since the epoch, for eviction. Not correctness — a wrong clock
     /// costs a suboptimal eviction and nothing else.
     last_used: u64,
+    /// Defaults to false so an index written before helper roles existed still reads.
+    #[serde(default)]
+    helper: bool,
+    /// FNV-1a of the file as written, so a compile can tell a corrupt file from a good one.
+    /// `None` for a file written before checksums; the first compile that trusts it records one.
+    #[serde(default)]
+    checksum: Option<u64>,
+    /// The compile shape that wrote it, whose next snapshot replaces it; `None` for a turn's own write.
+    #[serde(default)]
+    shape: Option<String>,
+    /// [`prefix_id`] of its tokens. A shape's deepest rung can fall inside the base prompt every
+    /// shape shares, so only this tells another shape's snapshot from its own.
+    #[serde(default)]
+    prefix: Option<u64>,
+}
+
+/// What a compile found for a prompt shape's snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PreambleHealth {
+    /// Only one prompt of this shape seen: the preamble is not known yet.
+    Unobserved,
+    /// The preamble is shorter than a snapshot is worth.
+    TooShort,
+    Valid,
+    Missing,
+    /// It covers a different stretch than the preamble the two prompts share.
+    Stale {
+        covers: usize,
+    },
+    /// Its bytes no longer match the checksum written beside it.
+    Corrupt,
 }
 
 /// The set of snapshots for one model, and which one a prompt should use.
@@ -179,13 +221,12 @@ struct SnapshotIndex {
 }
 
 impl SnapshotIndex {
-    /// The entry sharing the deepest ladder with `want`, if any shares at all.
+    /// The longest entry whose stored prefix begins `prompt`, if any does.
     ///
-    /// Ties go to the entry with MORE tokens: two snapshots agreeing to the same
-    /// rung are equally right about the part that was compared, and the longer
-    /// one saves more of the decode. The prefix check at load time is still what
-    /// makes the choice safe — the ladder narrows, it does not prove.
-    fn best_match(&self, want: &[(usize, u64)], prompt_tokens: usize) -> Option<&IndexEntry> {
+    /// The ladder narrows and a recorded prefix hash proves; for an entry written
+    /// before the hash, the prefix check at load time is what makes the choice safe.
+    fn best_match(&self, prompt: &[LlamaToken]) -> Option<&IndexEntry> {
+        let want = ladder(prompt);
         self.entries
             .iter()
             .filter(|e| {
@@ -196,7 +237,7 @@ impl SnapshotIndex {
                 //
                 // 1. A snapshot at least as long as the prompt leaves nothing to
                 //    decode, which `load` rejects anyway.
-                if e.tokens >= prompt_tokens {
+                if e.tokens >= prompt.len() {
                     return false;
                 }
                 // 2. The ladder has to agree at least as deep as the snapshot's
@@ -204,10 +245,47 @@ impl SnapshotIndex {
                 //    diverges from this prompt BEFORE it ends, so it is not a
                 //    prefix of it and no amount of reading will change that.
                 let own_depth = e.ladder.last().map_or(0, |(d, _)| *d);
-                ladder_agreement(&e.ladder, want) >= own_depth && own_depth > 0
+                if ladder_agreement(&e.ladder, &want) < own_depth || own_depth == 0 {
+                    return false;
+                }
+                // 3. The whole stored prefix, hashed: never another shape's file.
+                e.prefix
+                    .is_none_or(|prefix| prefix_id(&prompt[..e.tokens]) == prefix)
             })
             .max_by_key(|e| e.tokens)
     }
+
+    /// Adds `entry` and returns the files it replaces. The prime and every role open alike, so an
+    /// opening never decides: a named shape replaces only its own, an unnamed write the unnamed one.
+    fn admit(&mut self, mut entry: IndexEntry) -> Vec<String> {
+        if let Some(same) = self.entries.iter().find(|e| e.file == entry.file) {
+            entry.shape = entry.shape.or_else(|| same.shape.clone());
+        }
+        let opening = entry.ladder.first().map(|(_, h)| *h);
+        let replaced: Vec<String> = self
+            .entries
+            .iter()
+            .filter(|e| e.file != entry.file)
+            .filter(|e| match &entry.shape {
+                Some(shape) => e.shape.as_ref() == Some(shape),
+                None => e.shape.is_none() && e.ladder.first().map(|(_, h)| *h) == opening,
+            })
+            .map(|e| e.file.clone())
+            .collect();
+        self.entries
+            .retain(|e| e.file != entry.file && !replaced.contains(&e.file));
+        self.entries.push(entry);
+        replaced
+    }
+}
+
+/// Names a snapshot by everything it holds, so two preambles sharing an opening never share a file.
+fn prefix_id(tokens: &[LlamaToken]) -> u64 {
+    let mut h = Fnv::new();
+    for t in tokens {
+        h.write(&t.0.to_le_bytes());
+    }
+    h.finish()
 }
 
 /// Identity of a snapshot: everything that must match for the stored bytes to
@@ -382,6 +460,8 @@ pub(super) struct SnapshotSlot {
     /// is what produced an intersection of nothing and, before that, a snapshot
     /// over-fitted to whichever caller ran first.
     buckets: HashMap<u64, Bucket>,
+    /// The last compile prompt per named shape: what a shape's next compile call pairs with.
+    compile_prompts: HashMap<String, Vec<LlamaToken>>,
 }
 
 /// One prompt shape's converging prefix.
@@ -440,6 +520,7 @@ impl SnapshotSlot {
             key,
             index,
             buckets: HashMap::new(),
+            compile_prompts: HashMap::new(),
         }
     }
 
@@ -526,7 +607,13 @@ impl SnapshotSlot {
     /// llama.cpp writes whatever the sequence holds, so trimming is how the
     /// "only the stable prefix" property is enforced rather than merely
     /// intended.
-    pub(super) fn write(&mut self, ctx: &LlamaContext<'_>, tokens: &[LlamaToken]) -> bool {
+    pub(super) fn write(
+        &mut self,
+        ctx: &LlamaContext<'_>,
+        tokens: &[LlamaToken],
+        class: SnapshotClass,
+        shape: Option<&str>,
+    ) -> bool {
         let Some(bucket) = Self::bucket_of(tokens) else {
             return false;
         };
@@ -544,8 +631,9 @@ impl SnapshotSlot {
         }
 
         let rungs = ladder(tokens);
+        let prefix = prefix_id(tokens);
         let file = format!(
-            "v{SNAPSHOT_FORMAT_VERSION}-{:016x}-{:016x}.kv",
+            "v{SNAPSHOT_FORMAT_VERSION}-{:016x}-{:016x}-{prefix:016x}.kv",
             self.key.family(),
             bucket
         );
@@ -566,13 +654,19 @@ impl SnapshotSlot {
                     self.buckets.entry(bucket).or_default().settled = true;
                     return false;
                 }
-                self.index.entries.retain(|e| e.file != file);
-                self.index.entries.push(IndexEntry {
+                let replaced = self.index.admit(IndexEntry {
                     file: file.clone(),
                     tokens: tokens.len(),
                     ladder: rungs,
                     last_used: now_secs(),
+                    helper: class == SnapshotClass::Helper,
+                    checksum: file_checksum(&final_path),
+                    shape: shape.map(str::to_string),
+                    prefix: Some(prefix),
                 });
+                for old in &replaced {
+                    let _ = std::fs::remove_file(self.dir.join(old));
+                }
                 self.evict_beyond_cap();
                 self.save_index();
 
@@ -584,6 +678,8 @@ impl SnapshotSlot {
                     kib_per_token = bytes as f64 / 1024.0 / tokens.len().max(1) as f64,
                     elapsed_ms = started.elapsed().as_millis() as u64,
                     snapshots_for_model = self.index.entries.len(),
+                    replaced = replaced.len(),
+                    shape = shape.unwrap_or(""),
                     path = %final_path.display(),
                     "kv snapshot saved; this prompt shape now resumes from disk"
                 );
@@ -611,8 +707,7 @@ impl SnapshotSlot {
         ctx: &mut LlamaContext<'_>,
         prompt: &[LlamaToken],
     ) -> Option<usize> {
-        let rungs = ladder(prompt);
-        let chosen = self.index.best_match(&rungs, prompt.len())?.clone();
+        let chosen = self.index.best_match(prompt)?.clone();
         let path = self.dir.join(&chosen.file);
         if !path.exists() {
             self.forget(&chosen.file, "index named a file that is gone");
@@ -733,14 +828,130 @@ impl SnapshotSlot {
         }
     }
 
-    /// Keep the newest `MAX_SNAPSHOTS`, deleting the rest.
+    /// Judge the snapshot a real turn of `prompt`'s shape would restore, against the preamble two
+    /// compile prompts share. A file that fails is retired and the shape reopened for a write.
+    pub(super) fn preamble_health(&mut self, prompt: &[LlamaToken]) -> PreambleHealth {
+        let Some(bucket) = Self::bucket_of(prompt) else {
+            return PreambleHealth::TooShort;
+        };
+        let (stable, intersected) = match self.buckets.get(&bucket) {
+            Some(b) => (b.stable.as_ref().map_or(0, Vec::len), b.intersected),
+            None => (0, false),
+        };
+        if !intersected {
+            return PreambleHealth::Unobserved;
+        }
+        self.preamble_health_at(prompt, stable, false)
+    }
+
+    /// The preamble a named shape's compile calls share: `None` for the first call of a pair,
+    /// then what this prompt has in common with the shape's previous one.
+    pub(super) fn compile_preamble(&mut self, shape: &str, prompt: &[LlamaToken]) -> Option<usize> {
+        self.compile_prompts
+            .insert(shape.to_string(), prompt.to_vec())
+            .map(|previous| common_prefix_len(&previous, prompt).min(SNAPSHOT_MAX_TOKENS))
+    }
+
+    /// [`preamble_health`](Self::preamble_health) against a preamble the caller already knows.
+    pub(super) fn preamble_health_at(
+        &mut self,
+        prompt: &[LlamaToken],
+        stable: usize,
+        rebuild: bool,
+    ) -> PreambleHealth {
+        let Some(bucket) = Self::bucket_of(prompt) else {
+            return PreambleHealth::TooShort;
+        };
+        let preamble = stable.min(SNAPSHOT_MAX_TOKENS);
+        if preamble < SNAPSHOT_MIN_TOKENS {
+            return PreambleHealth::TooShort;
+        }
+        let chosen = self.index.best_match(prompt).cloned();
+        let health = match chosen {
+            None => PreambleHealth::Missing,
+            Some(entry) => {
+                let path = self.dir.join(&entry.file);
+                match (file_checksum(&path), entry.checksum) {
+                    (None, _) => {
+                        self.forget(&entry.file, "index named a file that is gone");
+                        PreambleHealth::Missing
+                    }
+                    (Some(now), Some(written)) if now != written => {
+                        self.retire(&entry.file, "its bytes no longer match its checksum");
+                        PreambleHealth::Corrupt
+                    }
+                    (Some(now), recorded) => {
+                        if entry.tokens != preamble {
+                            self.retire(&entry.file, "it does not cover the preamble exactly");
+                            PreambleHealth::Stale {
+                                covers: entry.tokens,
+                            }
+                        } else if rebuild {
+                            self.retire(&entry.file, "a member asked for it to be rebuilt");
+                            PreambleHealth::Stale {
+                                covers: entry.tokens,
+                            }
+                        } else {
+                            if recorded.is_none() {
+                                self.record_checksum(&entry.file, now);
+                            }
+                            PreambleHealth::Valid
+                        }
+                    }
+                }
+            }
+        };
+        // A valid file needs no write; anything else must be free to be rewritten this process.
+        self.buckets.entry(bucket).or_default().settled = health == PreambleHealth::Valid;
+        health
+    }
+
+    /// Discards helper snapshots last used more than `max_idle_secs` ago: a role nobody runs any
+    /// more must not hold disk. Chat shapes are never aged out here.
+    pub(super) fn retire_idle_helpers(&mut self, max_idle_secs: u64) {
+        let cutoff = now_secs().saturating_sub(max_idle_secs);
+        let idle: Vec<String> = self
+            .index
+            .entries
+            .iter()
+            .filter(|e| e.helper && e.last_used < cutoff)
+            .map(|e| e.file.clone())
+            .collect();
+        for file in idle {
+            self.retire(&file, "a helper snapshot unused past its retention");
+        }
+    }
+
+    fn record_checksum(&mut self, file: &str, checksum: u64) {
+        if let Some(entry) = self.index.entries.iter_mut().find(|e| e.file == file) {
+            entry.checksum = Some(checksum);
+        }
+        self.save_index();
+    }
+
+    /// Keep the newest `MAX_SNAPSHOTS` shared and `MAX_HELPER_SNAPSHOTS` helper snapshots,
+    /// deleting the rest.
     fn evict_beyond_cap(&mut self) {
-        while self.index.entries.len() > MAX_SNAPSHOTS {
+        for (helper, cap) in [(false, MAX_SNAPSHOTS), (true, MAX_HELPER_SNAPSHOTS)] {
+            self.evict_class_beyond(helper, cap);
+        }
+    }
+
+    fn evict_class_beyond(&mut self, helper: bool, cap: usize) {
+        while self
+            .index
+            .entries
+            .iter()
+            .filter(|e| e.helper == helper)
+            .count()
+            > cap
+        {
             let Some((i, victim)) = self
                 .index
                 .entries
                 .iter()
                 .enumerate()
+                .filter(|(_, e)| e.helper == helper)
                 .min_by_key(|(_, e)| e.last_used)
                 .map(|(i, e)| (i, e.file.clone()))
             else {
@@ -752,10 +963,37 @@ impl SnapshotSlot {
                 target: KV_TARGET,
                 event = "discarded",
                 reason = "least recently used, over the per-model cap",
-                cap = MAX_SNAPSHOTS,
+                cap,
+                helper,
                 file = %victim,
                 "kv snapshot evicted"
             );
+        }
+    }
+}
+
+/// FNV-1a over a file's bytes in whole 1 MiB chunks; `None` when it cannot be read. Chunks are
+/// filled before hashing because `Fnv` mixes in each write's length, so a short read would change
+/// the sum.
+fn file_checksum(path: &Path) -> Option<u64> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut hash = Fnv::new();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let mut filled = 0;
+        while filled < buf.len() {
+            match file.read(&mut buf[filled..]).ok()? {
+                0 => break,
+                n => filled += n,
+            }
+        }
+        if filled == 0 {
+            return Some(hash.finish());
+        }
+        hash.write(&buf[..filled]);
+        if filled < buf.len() {
+            return Some(hash.finish());
         }
     }
 }
@@ -818,6 +1056,306 @@ mod tests {
         (0..len)
             .map(|i| LlamaToken(if i < 256 { lead } else { i as i32 }))
             .collect()
+    }
+
+    fn entry(file: &str, last_used: u64, helper: bool) -> IndexEntry {
+        IndexEntry {
+            file: file.into(),
+            tokens: 2000,
+            ladder: Vec::new(),
+            last_used,
+            helper,
+            checksum: None,
+            shape: None,
+            prefix: None,
+        }
+    }
+
+    /// A slot in a real directory, having seen two prompts that share their first 1,500 tokens.
+    fn compiled_slot(dir: &Path) -> (SnapshotSlot, Vec<LlamaToken>) {
+        let mut s = SnapshotSlot::new(
+            dir.to_path_buf(),
+            SnapshotKey {
+                model_path: PathBuf::from("/m.gguf"),
+                model_len: 1,
+                model_mtime_secs: 2,
+                n_ctx: 4096,
+                layout: 0,
+            },
+        );
+        let a = shaped(7, 1600);
+        let mut b = a[..1500].to_vec();
+        b.extend(std::iter::repeat_n(LlamaToken(-5), 100));
+        s.observe(&a);
+        s.observe(&b);
+        (s, b)
+    }
+
+    fn stored(dir: &Path, prompt: &[LlamaToken], tokens: usize, bytes: &[u8]) -> IndexEntry {
+        let file = format!("covers-{tokens}.kv");
+        std::fs::write(dir.join(&file), bytes).unwrap();
+        IndexEntry {
+            file: file.clone(),
+            tokens,
+            ladder: ladder(&prompt[..tokens]),
+            last_used: 1,
+            helper: false,
+            checksum: file_checksum(&dir.join(&file)),
+            shape: None,
+            prefix: Some(prefix_id(&prompt[..tokens])),
+        }
+    }
+
+    #[test]
+    fn a_compile_keeps_a_good_snapshot_and_reopens_every_kind_of_bad_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut s, prompt) = compiled_slot(tmp.path());
+        assert_eq!(s.preamble_health(&prompt), PreambleHealth::Missing);
+
+        let good = stored(tmp.path(), &prompt, 1500, b"kv bytes");
+        s.index.entries.push(good.clone());
+        assert_eq!(s.preamble_health(&prompt), PreambleHealth::Valid);
+        assert_eq!(
+            s.writable_prefix(&prompt),
+            None,
+            "a valid shape is not written again"
+        );
+
+        std::fs::write(tmp.path().join(&good.file), b"kv bytEs").unwrap();
+        assert_eq!(s.preamble_health(&prompt), PreambleHealth::Corrupt);
+        assert!(
+            !tmp.path().join(&good.file).exists(),
+            "a corrupt file is retired"
+        );
+        assert_eq!(
+            s.writable_prefix(&prompt),
+            Some(1500),
+            "and the shape is free to be written again"
+        );
+
+        s.index
+            .entries
+            .push(stored(tmp.path(), &prompt, 1200, b"older"));
+        assert_eq!(
+            s.preamble_health(&prompt),
+            PreambleHealth::Stale { covers: 1200 },
+            "a snapshot of an older, shorter preamble is not the preamble"
+        );
+
+        let mut unsummed = stored(tmp.path(), &prompt, 1500, b"from before checksums");
+        unsummed.checksum = None;
+        s.index.entries.push(unsummed);
+        assert_eq!(s.preamble_health(&prompt), PreambleHealth::Valid);
+        assert!(
+            s.index.entries[0].checksum.is_some(),
+            "a file trusted once is summed, so a later change shows"
+        );
+    }
+
+    #[test]
+    fn an_idle_helper_snapshot_is_discarded_and_a_chat_shape_never_is() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut s, prompt) = compiled_slot(tmp.path());
+        let now = now_secs();
+        let day = 86_400;
+        let mut old_helper = stored(tmp.path(), &prompt, 1500, b"old role");
+        old_helper.helper = true;
+        old_helper.last_used = now - 20 * day;
+        let mut fresh_helper = stored(tmp.path(), &prompt, 1200, b"fresh role");
+        fresh_helper.helper = true;
+        fresh_helper.last_used = now - day;
+        let mut old_chat = stored(tmp.path(), &prompt, 1100, b"old chat");
+        old_chat.last_used = now - 20 * day;
+        s.index.entries = vec![old_helper.clone(), fresh_helper.clone(), old_chat.clone()];
+
+        s.retire_idle_helpers(14 * day);
+        let kept: Vec<&str> = s.index.entries.iter().map(|e| e.file.as_str()).collect();
+        assert!(
+            !kept.contains(&old_helper.file.as_str()),
+            "an idle role's snapshot must go"
+        );
+        assert!(
+            !tmp.path().join(&old_helper.file).exists(),
+            "and its file with it"
+        );
+        assert!(
+            kept.contains(&fresh_helper.file.as_str()),
+            "a role used yesterday stays"
+        );
+        assert!(
+            kept.contains(&old_chat.file.as_str()),
+            "chat shapes are kept by the shared cap, never aged out here"
+        );
+    }
+
+    /// Roles open with the same base prompt, so their buckets collide and a bucket's intersection
+    /// is only that base. A named pair gives each shape its own preamble.
+    #[test]
+    fn a_named_compile_pair_learns_its_own_preamble_beside_a_shape_sharing_its_opening() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut s, _) = compiled_slot(tmp.path());
+        let base = shaped(7, 600);
+        let with = |persona: i32, persona_len: usize, brief: i32| -> Vec<LlamaToken> {
+            let mut p = base.clone();
+            p.extend(std::iter::repeat_n(LlamaToken(persona), persona_len));
+            p.extend(std::iter::repeat_n(LlamaToken(brief), 30));
+            p
+        };
+        let (planner_a, planner_b) = (with(-10, 900, -1), with(-10, 900, -2));
+        let (worker_a, worker_b) = (with(-20, 1400, -1), with(-20, 1400, -2));
+
+        assert_eq!(s.compile_preamble("role:planner", &planner_a), None);
+        assert_eq!(s.compile_preamble("role:worker", &worker_a), None);
+        assert_eq!(s.compile_preamble("role:planner", &planner_b), Some(1500));
+        assert_eq!(s.compile_preamble("role:worker", &worker_b), Some(2000));
+
+        s.observe(&planner_a);
+        s.observe(&worker_b);
+        assert_eq!(
+            s.stable_len(&planner_a),
+            Some(600),
+            "the bucket alone collapses to the shared base, which is why pairs are named"
+        );
+    }
+
+    #[test]
+    fn one_prompt_says_nothing_about_the_preamble() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = SnapshotSlot::new(
+            tmp.path().to_path_buf(),
+            SnapshotKey {
+                model_path: PathBuf::from("/m.gguf"),
+                model_len: 1,
+                model_mtime_secs: 2,
+                n_ctx: 4096,
+                layout: 0,
+            },
+        );
+        let a = shaped(7, 1600);
+        s.observe(&a);
+        assert_eq!(s.preamble_health(&a), PreambleHealth::Unobserved);
+    }
+
+    #[test]
+    fn a_checksum_is_the_same_however_the_file_is_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("big.kv");
+        std::fs::write(&path, vec![7u8; (1 << 20) * 2 + 13]).unwrap();
+        let once = file_checksum(&path);
+        assert!(once.is_some());
+        assert_eq!(file_checksum(&path), once);
+        std::fs::write(&path, vec![7u8; (1 << 20) * 2 + 14]).unwrap();
+        assert_ne!(
+            file_checksum(&path),
+            once,
+            "one more byte must change the sum"
+        );
+    }
+
+    /// A household's roles fill their own cap; the oldest helper goes, never a chat shape, even
+    /// when the chat shape is older than every helper.
+    /// The prime and every role open with the same base prompt; only a shape's own next snapshot
+    /// may replace it, where one file per opening once kept the last shape compiled.
+    #[test]
+    fn shapes_sharing_an_opening_keep_a_snapshot_each() {
+        let a = shaped(7, 2000);
+        let mut b = a.clone();
+        b[1500] = LlamaToken(-3);
+        assert_ne!(
+            prefix_id(&a),
+            prefix_id(&b),
+            "a shared opening must not share a name"
+        );
+
+        let opening = ladder(&a);
+        let stranger = ladder(&shaped(9, 2000));
+        let named = |file: &str, shape: &str| IndexEntry {
+            ladder: opening.clone(),
+            shape: Some(shape.into()),
+            ..entry(file, 1, true)
+        };
+        let unnamed = |file: &str, ladder: &[(usize, u64)]| IndexEntry {
+            ladder: ladder.to_vec(),
+            ..entry(file, 1, false)
+        };
+        let mut index = SnapshotIndex::default();
+        for (file, shape) in [
+            ("prime.kv", "prime-typed"),
+            ("planner.kv", "role:planner"),
+            ("worker.kv", "role:worker"),
+        ] {
+            assert!(
+                index.admit(named(file, shape)).is_empty(),
+                "{shape} must not replace another shape"
+            );
+        }
+        assert!(
+            index.admit(unnamed("turn.kv", &opening)).is_empty(),
+            "a turn's own write must not replace a compiled shape"
+        );
+        assert!(index.admit(unnamed("elsewhere.kv", &stranger)).is_empty());
+        assert_eq!(
+            index.admit(named("planner-2.kv", "role:planner")),
+            vec!["planner.kv".to_string()],
+            "a shape's new snapshot replaces its old one"
+        );
+        assert_eq!(
+            index.admit(unnamed("turn-2.kv", &opening)),
+            vec!["turn.kv".to_string()],
+            "an unnamed write replaces the unnamed one opening the same way"
+        );
+        assert!(index.admit(unnamed("worker.kv", &opening)).is_empty());
+        let kept: Vec<(&str, Option<&str>)> = index
+            .entries
+            .iter()
+            .map(|e| (e.file.as_str(), e.shape.as_deref()))
+            .collect();
+        assert_eq!(kept.len(), 5, "{kept:?}");
+        assert!(
+            kept.contains(&("worker.kv", Some("role:worker"))),
+            "rewriting a shape's file keeps its shape: {kept:?}"
+        );
+    }
+
+    #[test]
+    fn helper_snapshots_evict_each_other_and_never_a_chat_shape() {
+        let mut s = slot();
+        s.index.entries.push(entry("chat.kv", 1, false));
+        for i in 0..=MAX_HELPER_SNAPSHOTS as u64 {
+            s.index
+                .entries
+                .push(entry(&format!("role-{i}.kv"), 10 + i, true));
+        }
+        s.evict_beyond_cap();
+        let kept: Vec<&str> = s.index.entries.iter().map(|e| e.file.as_str()).collect();
+        assert!(
+            kept.contains(&"chat.kv"),
+            "a helper evicted a chat shape: {kept:?}"
+        );
+        assert!(
+            !kept.contains(&"role-0.kv"),
+            "the oldest helper must go: {kept:?}"
+        );
+        assert_eq!(kept.len(), 1 + MAX_HELPER_SNAPSHOTS);
+
+        // The control: the shared cap still evicts, or the test above passes with no cap at all.
+        let mut s = slot();
+        for i in 0..=MAX_SNAPSHOTS as u64 {
+            s.index
+                .entries
+                .push(entry(&format!("chat-{i}.kv"), i, false));
+        }
+        s.index.entries.push(entry("role.kv", 0, true));
+        s.evict_beyond_cap();
+        let kept: Vec<&str> = s.index.entries.iter().map(|e| e.file.as_str()).collect();
+        assert!(
+            !kept.contains(&"chat-0.kv"),
+            "the oldest chat shape must go: {kept:?}"
+        );
+        assert!(
+            kept.contains(&"role.kv"),
+            "a chat shape evicted a helper: {kept:?}"
+        );
     }
 
     /// The stable prefix is an intersection, not a memory of the last prompt.
@@ -896,25 +1434,31 @@ mod tests {
                     tokens: 600,
                     ladder: shallow_same_shape,
                     last_used: 1,
+                    helper: false,
+                    checksum: None,
+                    shape: None,
+                    prefix: None,
                 },
                 IndexEntry {
                     file: "deep.kv".into(),
                     tokens: 4000,
                     ladder: deep.clone(),
                     last_used: 1,
+                    helper: false,
+                    checksum: None,
+                    shape: None,
+                    prefix: None,
                 },
             ],
         };
         // A longer prompt of the same shape: the deeper snapshot serves it.
-        let incoming = ladder(&shaped(1, 5000));
+        let incoming = shaped(1, 5000);
         assert_eq!(
-            index.best_match(&incoming, 5000).map(|e| e.file.as_str()),
+            index.best_match(&incoming).map(|e| e.file.as_str()),
             Some("deep.kv")
         );
         assert_eq!(
-            index
-                .best_match(&other_shape, 5000)
-                .map(|e| e.file.as_str()),
+            index.best_match(&shaped(2, 5000)).map(|e| e.file.as_str()),
             None,
             "a prompt shape with no stored cache must get nothing rather than the wrong one"
         );
@@ -922,24 +1466,51 @@ mod tests {
         // The refusals that save a read. Each would otherwise cost tens to
         // hundreds of megabytes to discover.
         assert_eq!(
-            index.best_match(&incoming, 600).map(|e| e.file.as_str()),
+            index.best_match(&shaped(1, 600)).map(|e| e.file.as_str()),
             None,
             "a snapshot at least as long as the prompt leaves nothing to decode"
         );
         let diverges_early = {
             let mut p = shaped(1, 5000);
             p[700] = LlamaToken(-7);
-            ladder(&p)
+            p
         };
         assert_eq!(
-            index
-                .best_match(&diverges_early, 5000)
-                .map(|e| e.file.as_str()),
+            index.best_match(&diverges_early).map(|e| e.file.as_str()),
             Some("shallow.kv"),
             "the 4,000-token snapshot diverges from this prompt at token 700, so it cannot be \
              a prefix of it and must be refused FROM THE LADDER rather than by reading 4,000 \
              tokens of KV to find out -- while the 600-token one still genuinely is a prefix \
              and should be served"
+        );
+
+        // A role's deepest rung can sit inside the base every shape shares: only the whole
+        // prefix tells, and a wrong pick would be read, rejected and deleted.
+        let mut role = incoming[..1500].to_vec();
+        role[1200] = LlamaToken(-4);
+        let roles = SnapshotIndex {
+            entries: vec![IndexEntry {
+                tokens: role.len(),
+                ladder: ladder(&role),
+                prefix: Some(prefix_id(&role)),
+                ..entry("role.kv", 1, true)
+            }],
+        };
+        assert_eq!(
+            ladder_agreement(&roles.entries[0].ladder, &ladder(&incoming)),
+            1024,
+            "the ladder alone cannot tell this snapshot is another shape's"
+        );
+        assert!(
+            roles.best_match(&incoming).is_none(),
+            "another shape's snapshot must not be offered"
+        );
+        assert_eq!(
+            roles
+                .best_match(&[role.clone(), vec![LlamaToken(5); 40]].concat())
+                .map(|e| e.file.as_str()),
+            Some("role.kv"),
+            "its own shape still finds it"
         );
     }
 
