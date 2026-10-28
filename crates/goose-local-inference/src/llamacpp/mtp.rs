@@ -298,7 +298,10 @@ pub fn speculate(
     mtp.rollback_us += t.elapsed().as_micros() as u64;
     mtp.steps += 1;
 
-    mtp.accept(n_acc)?;
+    // A drafter that declined left nothing pending, and llama.cpp refuses an accept without one.
+    if !draft.is_empty() {
+        mtp.accept(n_acc)?;
+    }
     Ok(Some(SpecStep {
         tokens: accepted,
         next: (!model.is_eog_token(next)).then_some(next),
@@ -717,21 +720,19 @@ mod tests {
         );
         assert!(!plain.is_empty(), "the control run produced nothing");
 
-        for depth in [1i32, 4, 8, 12] {
+        // p_min 0.5 lets the drafter decline, which leaves some steps with no draft at all.
+        for (depth, p_min) in [(1i32, 0.0f32), (4, 0.0), (4, 0.5), (8, 0.0), (12, 0.0)] {
             let t1 = std::time::Instant::now();
-            let (spec, stats) = generate(
-                &model,
-                Some(&drafter),
-                &greedy(Some(depth)),
-                &prompt,
-                n_ctx,
-                budget,
-            );
+            let settings = ModelSettings {
+                draft_p_min: Some(p_min),
+                ..greedy(Some(depth))
+            };
+            let (spec, stats) = generate(&model, Some(&drafter), &settings, &prompt, n_ctx, budget);
             let spec_ms = t1.elapsed().as_millis().max(1) as f64;
             let r = stats.expect("a drafter was supplied, so there is an MTP session");
             let steps = r.steps.max(1) as f64;
             eprintln!(
-                "depth {depth:>2}: {:>5.0} ms  {:>4.2}x  |  {}/{} drafts kept ({:>3.0}%), \
+                "depth {depth:>2} p_min {p_min:.1}: {:>5.0} ms  {:>4.2}x  |  {}/{} drafts kept ({:>3.0}%), \
                  {:.2} tok/step  |  draft {:>5.1} + verify {:>5.1} ms/step",
                 spec_ms,
                 plain_ms / spec_ms,
@@ -756,7 +757,7 @@ mod tests {
             assert_eq!(
                 plain,
                 spec,
-                "speculative output diverged from the target at draft depth {depth} \
+                "speculative output diverged from the target at draft depth {depth}, p_min {p_min} \
                  ({} tokens vs {}). At temperature 0 these are DEFINED to be equal; a \
                  difference means either a draft was endorsed that the target would not \
                  have emitted, or the KV rollback dropped one it would have.",

@@ -381,6 +381,8 @@ impl SessionKv {
         settings: &ModelSettings,
     ) -> Result<Self, ProviderError> {
         let model = Arc::clone(model);
+        // llama.cpp refuses a drafter with no depth, so depth 0 is how speculation is turned off.
+        let draft = draft.filter(|_| settings.draft_n_max.is_none_or(|n| n > 0));
         let outputs = outputs_per_ubatch(draft.is_some(), settings);
         let ctx = model
             .new_context(
