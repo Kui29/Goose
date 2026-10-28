@@ -1854,6 +1854,7 @@ mod tests {
                         prime_waiting: false,
                         compile_prefill: None,
                         prefill_retention_secs: None,
+                        rebuild_prefill: false,
                     },
                 )
             });

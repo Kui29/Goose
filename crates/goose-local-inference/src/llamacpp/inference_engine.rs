@@ -112,6 +112,8 @@ pub(super) struct GenerationContext<'a> {
     pub compile_prefill: Option<String>,
     /// How long a helper snapshot may go unused before a compile discards it.
     pub prefill_retention_secs: Option<u64>,
+    /// The compile rebuilds even a valid snapshot (`LocalGenerationRequest::rebuild_prefill`).
+    pub rebuild_prefill: bool,
 }
 
 pub(super) struct LoadedModel {
@@ -1746,6 +1748,7 @@ fn prefill_prompt(
     suspended: &mut Option<SuspendedKv>,
     compile_prefill: Option<&str>,
     prefill_retention_secs: Option<u64>,
+    rebuild_prefill: bool,
 ) -> Result<PrefilledPrompt, ProviderError> {
     let n_ctx = u32::try_from(effective_ctx).map_err(|_| {
         ProviderError::ExecutionError(format!("Context size {effective_ctx} exceeds u32 range"))
@@ -1792,7 +1795,7 @@ fn prefill_prompt(
             let preamble = slot.compile_preamble(shape, prompt);
             let health = match preamble {
                 None => super::prompt_snapshot::PreambleHealth::Unobserved,
-                Some(preamble) => slot.preamble_health_at(prompt, preamble),
+                Some(preamble) => slot.preamble_health_at(prompt, preamble, rebuild_prefill),
             };
             if matches!(
                 health,
@@ -2494,6 +2497,7 @@ pub(super) fn prepare_generation(
             ctx.suspended,
             ctx.compile_prefill.as_deref(),
             ctx.prefill_retention_secs,
+            ctx.rebuild_prefill,
         )?;
         text_breakdown = Some((
             t_tok_done.duration_since(t_log_done).as_millis(),
@@ -3506,6 +3510,7 @@ pub(super) mod tests {
                 &mut None,
                 None,
                 None,
+                false,
             )
             .expect("prefill");
         }
@@ -3791,6 +3796,7 @@ pub(super) mod tests {
                     &mut suspended,
                     None,
                     None,
+                    false,
                 )
                 .expect("prefill")
                 .reused_prefix_tokens
@@ -3899,6 +3905,7 @@ pub(super) mod tests {
                     &mut suspended,
                     $compile,
                     None,
+                    false,
                 )
                 .expect("prefill")
                 .reused_prefix_tokens

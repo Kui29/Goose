@@ -9,6 +9,7 @@ tokio::task_local! {
     static PRIME_WAITING: bool;
     static COMPILING_PREFILL: Option<String>;
     static PREFILL_RETENTION_SECS: Option<u64>;
+    static PREFILL_REBUILD: bool;
 }
 
 /// Runs `f` as a call whose answer replaces the history of the conversation it is about, as a
@@ -105,6 +106,24 @@ pub fn prefill_retention_secs() -> Option<u64> {
     PREFILL_RETENTION_SECS.try_with(|secs| *secs).ok().flatten()
 }
 
+/// [`compiling_prefill`] that rebuilds the shape's snapshot even when it is valid: a member
+/// asked for its cache to be invalidated.
+pub async fn rebuilding_prefill<F: std::future::Future>(
+    shape: impl Into<String>,
+    f: F,
+) -> F::Output {
+    COMPILING_PREFILL
+        .scope(Some(shape.into()), PREFILL_REBUILD.scope(true, f))
+        .await
+}
+
+/// Whether the current compile is [`rebuilding_prefill`]; `false` outside it.
+pub fn is_rebuilding_prefill() -> bool {
+    PREFILL_REBUILD
+        .try_with(|rebuild| *rebuild)
+        .unwrap_or(false)
+}
+
 /// The shape the current [`compiling_prefill`] call compiles; `None` outside one.
 pub fn compiling_prefill_shape() -> Option<String> {
     COMPILING_PREFILL
@@ -173,6 +192,14 @@ mod tests {
             })
             .await;
         assert_eq!(retained, (true, Some(60)));
+        assert!(!compiling_prefill("role:worker", async { is_rebuilding_prefill() }).await);
+        assert!(
+            rebuilding_prefill("role:worker", async {
+                is_rebuilding_prefill() && is_compiling_prefill()
+            })
+            .await,
+            "a rebuild is a compile that does not keep a valid snapshot"
+        );
         assert_eq!(prefill_retention_secs(), None);
     }
 

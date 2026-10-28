@@ -791,7 +791,7 @@ impl SnapshotSlot {
         if !intersected {
             return PreambleHealth::Unobserved;
         }
-        self.preamble_health_at(prompt, stable)
+        self.preamble_health_at(prompt, stable, false)
     }
 
     /// The preamble a named shape's compile calls share: `None` for the first call of a pair,
@@ -807,6 +807,7 @@ impl SnapshotSlot {
         &mut self,
         prompt: &[LlamaToken],
         stable: usize,
+        rebuild: bool,
     ) -> PreambleHealth {
         let Some(bucket) = Self::bucket_of(prompt) else {
             return PreambleHealth::TooShort;
@@ -835,6 +836,11 @@ impl SnapshotSlot {
                     (Some(now), recorded) => {
                         if entry.tokens != preamble {
                             self.retire(&entry.file, "it does not cover the preamble exactly");
+                            PreambleHealth::Stale {
+                                covers: entry.tokens,
+                            }
+                        } else if rebuild {
+                            self.retire(&entry.file, "a member asked for it to be rebuilt");
                             PreambleHealth::Stale {
                                 covers: entry.tokens,
                             }

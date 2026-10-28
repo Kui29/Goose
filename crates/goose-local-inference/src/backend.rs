@@ -51,6 +51,8 @@ pub(super) struct LocalGenerationRequest<'a> {
     /// Helper snapshots unused for longer are discarded by this compile
     /// (see `request_context::compiling_prefill_retaining`).
     pub prefill_retention_secs: Option<u64>,
+    /// The compile rebuilds even a valid snapshot (see `request_context::rebuilding_prefill`).
+    pub rebuild_prefill: bool,
 }
 
 pub(super) trait LocalInferenceBackend: Send + Sync {

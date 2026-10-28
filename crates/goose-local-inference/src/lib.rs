@@ -776,6 +776,7 @@ impl Provider for LocalInferenceProvider {
         let compile_prefill = goose_provider_types::request_context::compiling_prefill_shape();
         let prefill_retention_secs =
             goose_provider_types::request_context::prefill_retention_secs();
+        let rebuild_prefill = goose_provider_types::request_context::is_rebuilding_prefill();
         let temperature = model_config.temperature;
         let max_tokens = model_config.max_tokens;
         let context_limit = model_context_limit;
@@ -982,6 +983,7 @@ impl Provider for LocalInferenceProvider {
                     prime_waiting,
                     compile_prefill,
                     prefill_retention_secs,
+                    rebuild_prefill,
                 };
 
                 let result = backend.generate(loaded, request);
