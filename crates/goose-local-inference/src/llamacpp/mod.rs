@@ -422,6 +422,7 @@ impl LocalInferenceBackend for LlamaCppBackend {
         settings: &crate::local_model_registry::ModelSettings,
     ) -> Result<Box<dyn BackendLoadedModel>, ProviderError> {
         let model_path = &resolved.model_path;
+        inference_engine::clear_suspended_leftovers();
 
         if !model_path.exists() {
             return Err(ProviderError::ExecutionError(format!(
@@ -516,6 +517,7 @@ impl LocalInferenceBackend for LlamaCppBackend {
             mtmd_ctx,
             session: None,
             snapshot: None,
+            suspended: None,
             model_path: model_path.clone(),
         }))
     }
@@ -678,6 +680,8 @@ impl LocalInferenceBackend for LlamaCppBackend {
             one_shot: request.tools.is_empty(),
             tool_calls_only: request.tool_calls_only,
             helper: request.helper,
+            prime_waiting: request.prime_waiting,
+            suspended: &mut loaded.suspended,
         };
 
         let result = if use_emulator {

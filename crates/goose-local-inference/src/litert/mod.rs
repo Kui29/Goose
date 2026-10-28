@@ -1851,6 +1851,7 @@ mod tests {
                         session_id: None,
                         tool_calls_only: false,
                         helper: false,
+                        prime_waiting: false,
                     },
                 )
             });
