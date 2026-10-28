@@ -39,6 +39,9 @@ pub(super) struct LocalGenerationRequest<'a> {
     /// end a turn only by cancelling it, and a cancelled conversation is not kept. The
     /// emulated-tools path ignores it too, because a tool call starts there as text.
     pub tool_calls_only: bool,
+    /// Made for a helper the prime is waiting on (see `request_context::as_helper`): on llama.cpp
+    /// it takes the model's one context instead of a second beside the prime's. LiteRT-LM ignores it.
+    pub helper: bool,
 }
 
 pub(super) trait LocalInferenceBackend: Send + Sync {

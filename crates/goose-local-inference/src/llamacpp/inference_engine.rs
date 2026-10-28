@@ -102,6 +102,8 @@ pub(super) struct GenerationContext<'a> {
     pub one_shot: bool,
     /// Only a tool call from this generation is used (`LocalGenerationRequest::tool_calls_only`).
     pub tool_calls_only: bool,
+    /// A helper the prime is waiting on (`LocalGenerationRequest::helper`).
+    pub helper: bool,
 }
 
 pub(super) struct LoadedModel {
@@ -331,8 +333,8 @@ pub(super) struct SessionKv {
     /// effective context of an incoming request; llama.cpp may round the
     /// realised `n_ctx` up, so the requested value is the stable identity.
     n_ctx: u32,
-    /// The last prefill into this cache was one-shot work, so nothing will
-    /// resume from it and it protects nothing (see `prefill_plan`).
+    /// The last prefill into this cache was one-shot work or a helper's, so it protects nothing:
+    /// at most that helper's own next turn resumes from it (see `prefill_plan`).
     one_shot: bool,
     /// When a generation last ran on this cache.
     last_used: std::time::Instant,
@@ -649,6 +651,12 @@ fn is_sacrificial_prompt(prompt_tokens: usize, cached_tokens: usize) -> bool {
 /// evicts it; another chat does once it has sat idle, or that chat's next turn prefills it all again.
 fn chat_cache_protected(prompt_is_chat: bool, idle: std::time::Duration) -> bool {
     !prompt_is_chat || idle < CHAT_CACHE_PROTECTED_FOR
+}
+
+/// Whether the retained cache is shielded from this prompt. A helper takes the one context: a
+/// second beside the prime's does not fit the device.
+fn retained_cache_protected(helper: bool, prompt_is_chat: bool, idle: std::time::Duration) -> bool {
+    !helper && chat_cache_protected(prompt_is_chat, idle)
 }
 
 /// Decide how to prefill a prompt whose plain-token part is `prompt`.
@@ -1466,6 +1474,7 @@ fn write_snapshot_if_due(
     snapshot: &mut Option<super::prompt_snapshot::SnapshotSlot>,
     prompt: &[LlamaToken],
     turn_was_cold: bool,
+    class: super::prompt_snapshot::SnapshotClass,
 ) {
     // Writing is not free: measured 21.2 MiB in 314 ms, about 67 MiB/s, which is
     // ~1.6 s for a 6,000-token preamble on an 18 KiB/token model and ~5 s on a
@@ -1525,7 +1534,7 @@ fn write_snapshot_if_due(
         }
         kv.tokens.extend_from_slice(&prompt[at..keep]);
     }
-    slot.write(kv.ctx.ctx(), &kv.tokens);
+    slot.write(kv.ctx.ctx(), &kv.tokens, class);
 
     // Put the tail back: the turn still has to generate from the whole prompt.
     match decode_checkpointed(kv, prompt, keep) {
@@ -1557,6 +1566,7 @@ fn prefill_prompt(
     prompt: &[LlamaToken],
     effective_ctx: usize,
     one_shot: bool,
+    helper: bool,
 ) -> Result<PrefilledPrompt, ProviderError> {
     let n_ctx = u32::try_from(effective_ctx).map_err(|_| {
         ProviderError::ExecutionError(format!("Context size {effective_ctx} exceeds u32 range"))
@@ -1575,6 +1585,11 @@ fn prefill_prompt(
         slot.observe(prompt);
     }
 
+    let class = if helper {
+        super::prompt_snapshot::SnapshotClass::Helper
+    } else {
+        super::prompt_snapshot::SnapshotClass::Shared
+    };
     let plan = prefill_plan(
         session.as_ref().map(|kv| {
             // A text-only prompt carries no media, so it can never reproduce a
@@ -1584,7 +1599,8 @@ fn prefill_prompt(
             } else {
                 RetainedPrefix::resumable(kv)
             };
-            retained.worth_protecting &= chat_cache_protected(!one_shot, kv.last_used.elapsed());
+            retained.worth_protecting &=
+                retained_cache_protected(helper, !one_shot, kv.last_used.elapsed());
             retained
         }),
         prompt,
@@ -1630,7 +1646,7 @@ fn prefill_prompt(
             match reuse_prefix(kv, prompt, resume) {
                 Ok(resumed) => {
                     // Warm by definition: this turn reused a prefix.
-                    write_snapshot_if_due(session, snapshot, prompt, false);
+                    write_snapshot_if_due(session, snapshot, prompt, false, class);
                     return Ok(PrefilledPrompt {
                         reused_prefix_tokens: resumed,
                         transient: None,
@@ -1696,7 +1712,7 @@ fn prefill_prompt(
         Err(e) => return Err(e),
     }
     // Cold: this path decoded the whole prompt.
-    write_snapshot_if_due(session, snapshot, prompt, true);
+    write_snapshot_if_due(session, snapshot, prompt, true, class);
     Ok(PrefilledPrompt {
         reused_prefix_tokens: 0,
         transient: None,
@@ -2244,6 +2260,7 @@ pub(super) fn prepare_generation(
             &tokens,
             ectx,
             ctx.one_shot,
+            ctx.helper,
         )?;
         text_breakdown = Some((
             t_tok_done.duration_since(t_log_done).as_millis(),
@@ -2266,7 +2283,7 @@ pub(super) fn prepare_generation(
         None => {
             if let Some(kv) = ctx.session.as_mut() {
                 kv.session_ctx_mut().ctx_mut().synchronize();
-                kv.one_shot = ctx.one_shot;
+                kv.one_shot = ctx.one_shot || ctx.helper;
                 kv.last_used = std::time::Instant::now();
                 // A rewind into this prompt's reply resumes at its end.
                 let tokens = std::mem::take(&mut kv.tokens);
@@ -2745,7 +2762,7 @@ pub(super) mod tests {
     #[test]
     #[ignore = "requires a real GGUF on disk; run with --ignored"]
     fn a_restored_snapshot_answers_identically_to_a_full_prefill() {
-        use crate::llamacpp::prompt_snapshot::SnapshotSlot;
+        use crate::llamacpp::prompt_snapshot::{SnapshotClass, SnapshotSlot};
         use llama_cpp_2::model::params::LlamaModelParams;
         use llama_cpp_2::model::AddBos;
 
@@ -2819,7 +2836,7 @@ pub(super) mod tests {
             kv.tokens.extend_from_slice(&prefix);
             let t = std::time::Instant::now();
             assert!(
-                slot.write(kv.ctx.ctx(), &kv.tokens),
+                slot.write(kv.ctx.ctx(), &kv.tokens, SnapshotClass::Shared),
                 "snapshot must be written"
             );
             eprintln!(
@@ -3251,6 +3268,7 @@ pub(super) mod tests {
                 prompt,
                 n_ctx,
                 false,
+                false,
             )
             .expect("prefill");
         }
@@ -3408,7 +3426,7 @@ pub(super) mod tests {
     #[test]
     #[ignore = "requires a real GGUF on disk; run with --ignored"]
     fn what_a_helper_turn_costs_the_prime() {
-        use crate::llamacpp::prompt_snapshot::SnapshotSlot;
+        use crate::llamacpp::prompt_snapshot::{SnapshotClass, SnapshotSlot};
         use llama_cpp_2::model::params::LlamaModelParams;
         use llama_cpp_2::model::AddBos;
         use std::time::Instant;
@@ -3521,13 +3539,16 @@ pub(super) mod tests {
 
         let mut slot =
             SnapshotSlot::for_model(&model_path, n_ctx, &settings).expect("slot for a real model");
-        for (name, tokens) in [("prime preamble", &preamble), ("role preamble", &role)] {
+        for (name, tokens, class) in [
+            ("prime preamble", &preamble, SnapshotClass::Shared),
+            ("role preamble", &role, SnapshotClass::Helper),
+        ] {
             let mut kv =
                 SessionKv::create(&model, draft.as_ref(), backend, n_ctx, &settings).expect("ctx");
             decode_tokens(kv.ctx.ctx_mut(), tokens, 0).expect("prefill preamble");
             let t = Instant::now();
             assert!(
-                slot.write(kv.ctx.ctx(), tokens),
+                slot.write(kv.ctx.ctx(), tokens, class),
                 "{name} snapshot must be written"
             );
             eprintln!("{name}: {} tokens saved in {} ms", tokens.len(), ms(t));
@@ -4194,6 +4215,16 @@ pub(super) mod tests {
             prefill_plan(Some(retained(&leftover, 16_384)), &chat_turn, 16_384),
             PrefillPlan::SacrificialContext,
             "a chat's cache of that size is still protected"
+        );
+    }
+
+    #[test]
+    fn a_helper_is_never_kept_out_of_the_one_context() {
+        let now = std::time::Duration::ZERO;
+        assert!(!retained_cache_protected(true, true, now));
+        assert!(
+            retained_cache_protected(false, true, now),
+            "a chat turn must still be shielded, or the helper case proves nothing"
         );
     }
 

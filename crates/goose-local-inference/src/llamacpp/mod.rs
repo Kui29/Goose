@@ -677,6 +677,7 @@ impl LocalInferenceBackend for LlamaCppBackend {
             model_load_ms: request.model_load_ms,
             one_shot: request.tools.is_empty(),
             tool_calls_only: request.tool_calls_only,
+            helper: request.helper,
         };
 
         let result = if use_emulator {

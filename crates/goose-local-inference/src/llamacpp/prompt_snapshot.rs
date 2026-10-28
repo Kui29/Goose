@@ -120,6 +120,17 @@ const LADDER_DEPTHS: &[usize] = &[256, 512, 1024, 2048, 4096, 8192, 16384];
 /// snapshot is ~70 MiB, so six is the difference between a cache and a problem.
 const MAX_SNAPSHOTS: usize = 6;
 
+/// How many helper-role snapshots the same key may keep beside those, so a household's saved
+/// roles never evict its own chat shapes.
+const MAX_HELPER_SNAPSHOTS: usize = 6;
+
+/// Which cap a snapshot counts against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SnapshotClass {
+    Shared,
+    Helper,
+}
+
 /// How stale a `last_used` stamp may get before the index is rewritten.
 const TOUCH_WRITE_INTERVAL_SECS: u64 = 3600;
 
@@ -167,6 +178,9 @@ struct IndexEntry {
     /// Seconds since the epoch, for eviction. Not correctness — a wrong clock
     /// costs a suboptimal eviction and nothing else.
     last_used: u64,
+    /// Defaults to false so an index written before helper roles existed still reads.
+    #[serde(default)]
+    helper: bool,
 }
 
 /// The set of snapshots for one model, and which one a prompt should use.
@@ -526,7 +540,12 @@ impl SnapshotSlot {
     /// llama.cpp writes whatever the sequence holds, so trimming is how the
     /// "only the stable prefix" property is enforced rather than merely
     /// intended.
-    pub(super) fn write(&mut self, ctx: &LlamaContext<'_>, tokens: &[LlamaToken]) -> bool {
+    pub(super) fn write(
+        &mut self,
+        ctx: &LlamaContext<'_>,
+        tokens: &[LlamaToken],
+        class: SnapshotClass,
+    ) -> bool {
         let Some(bucket) = Self::bucket_of(tokens) else {
             return false;
         };
@@ -572,6 +591,7 @@ impl SnapshotSlot {
                     tokens: tokens.len(),
                     ladder: rungs,
                     last_used: now_secs(),
+                    helper: class == SnapshotClass::Helper,
                 });
                 self.evict_beyond_cap();
                 self.save_index();
@@ -733,14 +753,29 @@ impl SnapshotSlot {
         }
     }
 
-    /// Keep the newest `MAX_SNAPSHOTS`, deleting the rest.
+    /// Keep the newest `MAX_SNAPSHOTS` shared and `MAX_HELPER_SNAPSHOTS` helper snapshots,
+    /// deleting the rest.
     fn evict_beyond_cap(&mut self) {
-        while self.index.entries.len() > MAX_SNAPSHOTS {
+        for (helper, cap) in [(false, MAX_SNAPSHOTS), (true, MAX_HELPER_SNAPSHOTS)] {
+            self.evict_class_beyond(helper, cap);
+        }
+    }
+
+    fn evict_class_beyond(&mut self, helper: bool, cap: usize) {
+        while self
+            .index
+            .entries
+            .iter()
+            .filter(|e| e.helper == helper)
+            .count()
+            > cap
+        {
             let Some((i, victim)) = self
                 .index
                 .entries
                 .iter()
                 .enumerate()
+                .filter(|(_, e)| e.helper == helper)
                 .min_by_key(|(_, e)| e.last_used)
                 .map(|(i, e)| (i, e.file.clone()))
             else {
@@ -752,7 +787,8 @@ impl SnapshotSlot {
                 target: KV_TARGET,
                 event = "discarded",
                 reason = "least recently used, over the per-model cap",
-                cap = MAX_SNAPSHOTS,
+                cap,
+                helper,
                 file = %victim,
                 "kv snapshot evicted"
             );
@@ -818,6 +854,59 @@ mod tests {
         (0..len)
             .map(|i| LlamaToken(if i < 256 { lead } else { i as i32 }))
             .collect()
+    }
+
+    fn entry(file: &str, last_used: u64, helper: bool) -> IndexEntry {
+        IndexEntry {
+            file: file.into(),
+            tokens: 2000,
+            ladder: Vec::new(),
+            last_used,
+            helper,
+        }
+    }
+
+    /// A household's roles fill their own cap; the oldest helper goes, never a chat shape, even
+    /// when the chat shape is older than every helper.
+    #[test]
+    fn helper_snapshots_evict_each_other_and_never_a_chat_shape() {
+        let mut s = slot();
+        s.index.entries.push(entry("chat.kv", 1, false));
+        for i in 0..=MAX_HELPER_SNAPSHOTS as u64 {
+            s.index
+                .entries
+                .push(entry(&format!("role-{i}.kv"), 10 + i, true));
+        }
+        s.evict_beyond_cap();
+        let kept: Vec<&str> = s.index.entries.iter().map(|e| e.file.as_str()).collect();
+        assert!(
+            kept.contains(&"chat.kv"),
+            "a helper evicted a chat shape: {kept:?}"
+        );
+        assert!(
+            !kept.contains(&"role-0.kv"),
+            "the oldest helper must go: {kept:?}"
+        );
+        assert_eq!(kept.len(), 1 + MAX_HELPER_SNAPSHOTS);
+
+        // The control: the shared cap still evicts, or the test above passes with no cap at all.
+        let mut s = slot();
+        for i in 0..=MAX_SNAPSHOTS as u64 {
+            s.index
+                .entries
+                .push(entry(&format!("chat-{i}.kv"), i, false));
+        }
+        s.index.entries.push(entry("role.kv", 0, true));
+        s.evict_beyond_cap();
+        let kept: Vec<&str> = s.index.entries.iter().map(|e| e.file.as_str()).collect();
+        assert!(
+            !kept.contains(&"chat-0.kv"),
+            "the oldest chat shape must go: {kept:?}"
+        );
+        assert!(
+            kept.contains(&"role.kv"),
+            "a chat shape evicted a helper: {kept:?}"
+        );
     }
 
     /// The stable prefix is an intersection, not a memory of the last prompt.
@@ -896,12 +985,14 @@ mod tests {
                     tokens: 600,
                     ladder: shallow_same_shape,
                     last_used: 1,
+                    helper: false,
                 },
                 IndexEntry {
                     file: "deep.kv".into(),
                     tokens: 4000,
                     ladder: deep.clone(),
                     last_used: 1,
+                    helper: false,
                 },
             ],
         };

@@ -1850,6 +1850,7 @@ mod tests {
                         replaces_history: false,
                         session_id: None,
                         tool_calls_only: false,
+                        helper: false,
                     },
                 )
             });

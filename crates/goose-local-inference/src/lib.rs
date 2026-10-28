@@ -771,6 +771,7 @@ impl Provider for LocalInferenceProvider {
         let replaces_history = goose_provider_types::request_context::replaces_history();
         let session_id = goose_provider_types::request_context::session();
         let tool_calls_only = goose_provider_types::request_context::wants_tool_calls_only();
+        let helper = goose_provider_types::request_context::is_helper();
         let temperature = model_config.temperature;
         let max_tokens = model_config.max_tokens;
         let context_limit = model_context_limit;
@@ -968,6 +969,7 @@ impl Provider for LocalInferenceProvider {
                     replaces_history,
                     session_id,
                     tool_calls_only,
+                    helper,
                 };
 
                 let result = backend.generate(loaded, request);

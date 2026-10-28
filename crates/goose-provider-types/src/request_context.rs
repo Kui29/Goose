@@ -5,6 +5,7 @@ tokio::task_local! {
     static REPLACES_HISTORY: bool;
     static SESSION: Option<String>;
     static TOOL_CALLS_ONLY: bool;
+    static HELPER: bool;
 }
 
 /// Runs `f` as a call whose answer replaces the history of the conversation it is about, as a
@@ -50,6 +51,18 @@ pub fn wants_tool_calls_only() -> bool {
     TOOL_CALLS_ONLY.try_with(|only| *only).unwrap_or(false)
 }
 
+/// Runs `f` as a call made for a helper agent the prime is waiting on. A provider keeping one
+/// context per model hands it that context, since the device cannot hold a second beside it.
+pub async fn as_helper<F: std::future::Future>(f: F) -> F::Output {
+    HELPER.scope(true, f).await
+}
+
+/// Whether the current call is [`as_helper`]; `false` outside it. Read it before handing work to
+/// another task.
+pub fn is_helper() -> bool {
+    HELPER.try_with(|helper| *helper).unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -68,6 +81,13 @@ mod tests {
                 .await
                 .unwrap();
         assert!(!inherited, "read it before spawning");
+    }
+
+    #[tokio::test]
+    async fn only_a_call_made_inside_the_scope_is_a_helper() {
+        assert!(!is_helper());
+        assert!(as_helper(async { is_helper() }).await);
+        assert!(!is_helper(), "the scope ends with its future");
     }
 
     #[tokio::test]
