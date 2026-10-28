@@ -373,6 +373,48 @@ pub(super) struct LlamaCppBackend {
 }
 
 impl LlamaCppBackend {
+    /// The MTP drafter at `path`. A drafter that fails to load degrades to no speculation rather
+    /// than failing the request: the target is what serves requests, and losing speed is not
+    /// losing service.
+    ///
+    /// CUDA builds only. Speculation pays where verifying a few drafts costs about one decode,
+    /// which is the Orin's CUDA path (2.1-2.3x in process); Metal re-runs its mat-vec kernel per
+    /// row up to a batch of 8 and measured 0.64-0.94x.
+    fn load_drafter(&self, path: &Path, params: &LlamaModelParams) -> Option<Arc<LlamaModel>> {
+        if !cfg!(feature = "cuda") {
+            tracing::debug!(
+                draft = %path.display(),
+                "MTP drafter ignored: speculation is enabled on CUDA builds only"
+            );
+            return None;
+        }
+        if !path.exists() {
+            tracing::warn!(
+                draft = %path.display(),
+                "MTP drafter not on disk; continuing without speculation"
+            );
+            return None;
+        }
+        match LlamaModel::load_from_file(&self.backend, path, params) {
+            Ok(d) => {
+                tracing::info!(
+                    backend = self.id(),
+                    draft = %path.display(),
+                    "MTP drafter loaded"
+                );
+                Some(Arc::new(d))
+            }
+            Err(e) => {
+                tracing::warn!(
+                    draft = %path.display(),
+                    error = %e,
+                    "MTP drafter failed to load; continuing without speculation"
+                );
+                None
+            }
+        }
+    }
+
     pub(super) fn new() -> Result<Self> {
         check_cpu_supports_local_inference()?;
 
@@ -438,48 +480,6 @@ impl LlamaCppBackend {
 impl LocalInferenceBackend for LlamaCppBackend {
     fn id(&self) -> &'static str {
         LLAMACPP_BACKEND_ID
-    }
-
-    /// The MTP drafter at `path`. A drafter that fails to load degrades to no speculation rather
-    /// than failing the request: the target is what serves requests, and losing speed is not
-    /// losing service.
-    ///
-    /// CUDA builds only. Speculation pays where verifying a few drafts costs about one decode,
-    /// which is the Orin's CUDA path (2.1-2.3x in process); Metal re-runs its mat-vec kernel per
-    /// row up to a batch of 8 and measured 0.64-0.94x.
-    fn load_drafter(&self, path: &Path, params: &LlamaModelParams) -> Option<Arc<LlamaModel>> {
-        if !cfg!(feature = "cuda") {
-            tracing::debug!(
-                draft = %path.display(),
-                "MTP drafter ignored: speculation is enabled on CUDA builds only"
-            );
-            return None;
-        }
-        if !path.exists() {
-            tracing::warn!(
-                draft = %path.display(),
-                "MTP drafter not on disk; continuing without speculation"
-            );
-            return None;
-        }
-        match LlamaModel::load_from_file(&self.backend, path, params) {
-            Ok(d) => {
-                tracing::info!(
-                    backend = self.id(),
-                    draft = %path.display(),
-                    "MTP drafter loaded"
-                );
-                Some(Arc::new(d))
-            }
-            Err(e) => {
-                tracing::warn!(
-                    draft = %path.display(),
-                    error = %e,
-                    "MTP drafter failed to load; continuing without speculation"
-                );
-                None
-            }
-        }
     }
 
     fn load_model(
