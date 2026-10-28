@@ -32,6 +32,7 @@ use llama_cpp_2::model::LlamaModel;
 use llama_cpp_2::speculative::{MtpSpeculative, MtpSpeculativeParams};
 use llama_cpp_2::token::LlamaToken;
 
+use goose_provider_types::conversation::token_usage::DraftStats;
 use goose_provider_types::errors::ProviderError;
 
 /// A target context with an MTP drafter attached.
@@ -89,6 +90,14 @@ impl MtpSession {
             rollback_us: 0,
             steps: 0,
         })
+    }
+
+    pub fn counts(&self) -> DraftCounts {
+        DraftCounts {
+            drafted: self.drafted,
+            accepted: self.accepted,
+            steps: self.steps,
+        }
     }
 
     pub fn target(&self) -> &LlamaContext<'static> {
@@ -157,6 +166,34 @@ impl MtpSession {
     }
 }
 
+/// A session's cumulative counters; a retained session spans turns, so a turn
+/// reports the difference between two readings.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DraftCounts {
+    drafted: u32,
+    accepted: u32,
+    steps: u32,
+}
+
+impl DraftCounts {
+    pub fn since(self, before: DraftCounts, emitted: usize) -> DraftStats {
+        let drafted = self.drafted.saturating_sub(before.drafted) as usize;
+        let accepted = self.accepted.saturating_sub(before.accepted) as usize;
+        DraftStats {
+            model: None,
+            draft_tokens: drafted,
+            accepted_tokens: accepted,
+            target_tokens: emitted,
+            rounds: self.steps.saturating_sub(before.steps) as usize,
+            accept_rate: if drafted == 0 {
+                0.0
+            } else {
+                accepted as f64 / drafted as f64
+            },
+        }
+    }
+}
+
 /// One speculative step.
 ///
 /// # Invariant
@@ -185,7 +222,7 @@ pub fn speculate(
     n_past: i32,
     id_last: LlamaToken,
     prompt: &[LlamaToken],
-) -> Result<SpecStep, ProviderError> {
+) -> Result<Option<SpecStep>, ProviderError> {
     let t = std::time::Instant::now();
     let draft = mtp.draft(n_past, id_last, prompt)?;
     mtp.draft_us += t.elapsed().as_micros() as u64;
@@ -202,9 +239,25 @@ pub fn speculate(
             .map_err(|e| ProviderError::ExecutionError(format!("batch add: {e}")))?;
     }
     let t = std::time::Instant::now();
-    mtp.target_mut()
-        .decode(&mut batch)
-        .map_err(|e| ProviderError::ExecutionError(format!("speculative decode: {e}")))?;
+    match mtp.target_mut().decode(&mut batch) {
+        Ok(()) => {}
+        // The verify batch found no room in the cache. llama.cpp placed none of it, so the target
+        // still stands on `n_past`, and `None` tells the caller to go on without speculating.
+        Err(llama_cpp_2::DecodeError::NoKvCacheSlot) => {
+            tracing::warn!(
+                target: "giap::kv",
+                n_past,
+                batch = seq.len(),
+                "speculative verify found no cache slot; this turn continues without drafting"
+            );
+            return Ok(None);
+        }
+        Err(e) => {
+            return Err(ProviderError::ExecutionError(format!(
+                "speculative decode: {e}"
+            )))
+        }
+    }
     // Metal and CUDA return from `decode` before the graph has run, so without
     // this the target's forward pass is billed to whichever phase reads an
     // output first -- which made `verify` read 1.2 ms against a 37.7 ms plain
@@ -245,11 +298,14 @@ pub fn speculate(
     mtp.rollback_us += t.elapsed().as_micros() as u64;
     mtp.steps += 1;
 
-    mtp.accept(n_acc)?;
-    Ok(SpecStep {
+    // A drafter that declined left nothing pending, and llama.cpp refuses an accept without one.
+    if !draft.is_empty() {
+        mtp.accept(n_acc)?;
+    }
+    Ok(Some(SpecStep {
         tokens: accepted,
         next: (!model.is_eog_token(next)).then_some(next),
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -274,6 +330,32 @@ mod tests {
     use llama_cpp_2::model::params::LlamaModelParams;
     use llama_cpp_2::model::AddBos;
     use std::sync::Arc;
+
+    #[test]
+    fn a_turn_reports_only_its_own_drafts() {
+        let before = DraftCounts {
+            drafted: 40,
+            accepted: 30,
+            steps: 10,
+        };
+        let after = DraftCounts {
+            drafted: 60,
+            accepted: 45,
+            steps: 15,
+        };
+        let stats = after.since(before, 80);
+        assert_eq!(
+            (
+                stats.draft_tokens,
+                stats.accepted_tokens,
+                stats.rounds,
+                stats.target_tokens
+            ),
+            (20, 15, 5, 80)
+        );
+        assert!((stats.accept_rate - 0.75).abs() < 1e-9);
+        assert_eq!(after.since(after, 3).accept_rate, 0.0);
+    }
 
     /// What one speculative run cost, by phase.
     struct DraftReport {
@@ -638,21 +720,19 @@ mod tests {
         );
         assert!(!plain.is_empty(), "the control run produced nothing");
 
-        for depth in [1i32, 4, 8, 12] {
+        // p_min 0.5 lets the drafter decline, which leaves some steps with no draft at all.
+        for (depth, p_min) in [(1i32, 0.0f32), (4, 0.0), (4, 0.5), (8, 0.0), (12, 0.0)] {
             let t1 = std::time::Instant::now();
-            let (spec, stats) = generate(
-                &model,
-                Some(&drafter),
-                &greedy(Some(depth)),
-                &prompt,
-                n_ctx,
-                budget,
-            );
+            let settings = ModelSettings {
+                draft_p_min: Some(p_min),
+                ..greedy(Some(depth))
+            };
+            let (spec, stats) = generate(&model, Some(&drafter), &settings, &prompt, n_ctx, budget);
             let spec_ms = t1.elapsed().as_millis().max(1) as f64;
             let r = stats.expect("a drafter was supplied, so there is an MTP session");
             let steps = r.steps.max(1) as f64;
             eprintln!(
-                "depth {depth:>2}: {:>5.0} ms  {:>4.2}x  |  {}/{} drafts kept ({:>3.0}%), \
+                "depth {depth:>2} p_min {p_min:.1}: {:>5.0} ms  {:>4.2}x  |  {}/{} drafts kept ({:>3.0}%), \
                  {:.2} tok/step  |  draft {:>5.1} + verify {:>5.1} ms/step",
                 spec_ms,
                 plain_ms / spec_ms,
@@ -677,7 +757,7 @@ mod tests {
             assert_eq!(
                 plain,
                 spec,
-                "speculative output diverged from the target at draft depth {depth} \
+                "speculative output diverged from the target at draft depth {depth}, p_min {p_min} \
                  ({} tokens vs {}). At temperature 0 these are DEFINED to be equal; a \
                  difference means either a draft was endorsed that the target would not \
                  have emitted, or the KV rollback dropped one it would have.",
