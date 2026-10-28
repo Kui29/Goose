@@ -45,8 +45,9 @@ pub(super) struct LocalGenerationRequest<'a> {
     /// A live turn waits on this helper, so llama.cpp sets that turn's cache aside on disk until
     /// the turn continues, instead of rebuilding it afterwards.
     pub prime_waiting: bool,
-    /// A prefill compile (see `request_context::compiling_prefill`). LiteRT-LM ignores it.
-    pub compile_prefill: bool,
+    /// The shape a prefill compile names (see `request_context::compiling_prefill`); `None` for
+    /// any other call. LiteRT-LM ignores it.
+    pub compile_prefill: Option<String>,
     /// Helper snapshots unused for longer are discarded by this compile
     /// (see `request_context::compiling_prefill_retaining`).
     pub prefill_retention_secs: Option<u64>,

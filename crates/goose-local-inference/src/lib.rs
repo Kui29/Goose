@@ -773,18 +773,18 @@ impl Provider for LocalInferenceProvider {
         let tool_calls_only = goose_provider_types::request_context::wants_tool_calls_only();
         let helper = goose_provider_types::request_context::is_helper();
         let prime_waiting = goose_provider_types::request_context::prime_is_waiting();
-        let compile_prefill = goose_provider_types::request_context::is_compiling_prefill();
+        let compile_prefill = goose_provider_types::request_context::compiling_prefill_shape();
         let prefill_retention_secs =
             goose_provider_types::request_context::prefill_retention_secs();
         let temperature = model_config.temperature;
-        // A compile only needs the prefill; one token proves the cache decodes.
-        let max_tokens = if compile_prefill {
-            Some(1)
-        } else {
-            model_config.max_tokens
-        };
+        let max_tokens = model_config.max_tokens;
         let context_limit = model_context_limit;
-        let settings = model_settings;
+        let mut settings = model_settings;
+        // A compile only needs the prefill; one token proves the cache decodes. The llama.cpp
+        // loop reads its budget from the settings, not from the request's max_tokens.
+        if compile_prefill.is_some() {
+            settings.max_output_tokens = Some(1);
+        }
         let resolved_model = resolved.clone();
         let system = system.to_string();
         let messages = messages.to_vec();

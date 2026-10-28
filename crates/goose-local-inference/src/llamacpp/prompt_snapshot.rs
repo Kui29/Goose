@@ -417,6 +417,8 @@ pub(super) struct SnapshotSlot {
     /// is what produced an intersection of nothing and, before that, a snapshot
     /// over-fitted to whichever caller ran first.
     buckets: HashMap<u64, Bucket>,
+    /// The last compile prompt per named shape: what a shape's next compile call pairs with.
+    compile_prompts: HashMap<String, Vec<LlamaToken>>,
 }
 
 /// One prompt shape's converging prefix.
@@ -475,6 +477,7 @@ impl SnapshotSlot {
             key,
             index,
             buckets: HashMap::new(),
+            compile_prompts: HashMap::new(),
         }
     }
 
@@ -788,6 +791,26 @@ impl SnapshotSlot {
         if !intersected {
             return PreambleHealth::Unobserved;
         }
+        self.preamble_health_at(prompt, stable)
+    }
+
+    /// The preamble a named shape's compile calls share: `None` for the first call of a pair,
+    /// then what this prompt has in common with the shape's previous one.
+    pub(super) fn compile_preamble(&mut self, shape: &str, prompt: &[LlamaToken]) -> Option<usize> {
+        self.compile_prompts
+            .insert(shape.to_string(), prompt.to_vec())
+            .map(|previous| common_prefix_len(&previous, prompt).min(SNAPSHOT_MAX_TOKENS))
+    }
+
+    /// [`preamble_health`](Self::preamble_health) against a preamble the caller already knows.
+    pub(super) fn preamble_health_at(
+        &mut self,
+        prompt: &[LlamaToken],
+        stable: usize,
+    ) -> PreambleHealth {
+        let Some(bucket) = Self::bucket_of(prompt) else {
+            return PreambleHealth::TooShort;
+        };
         let preamble = stable.min(SNAPSHOT_MAX_TOKENS);
         if preamble < SNAPSHOT_MIN_TOKENS {
             return PreambleHealth::TooShort;
@@ -1105,6 +1128,36 @@ mod tests {
         assert!(
             kept.contains(&old_chat.file.as_str()),
             "chat shapes are kept by the shared cap, never aged out here"
+        );
+    }
+
+    /// Roles open with the same base prompt, so their buckets collide and a bucket's intersection
+    /// is only that base. A named pair gives each shape its own preamble.
+    #[test]
+    fn a_named_compile_pair_learns_its_own_preamble_beside_a_shape_sharing_its_opening() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut s, _) = compiled_slot(tmp.path());
+        let base = shaped(7, 600);
+        let with = |persona: i32, persona_len: usize, brief: i32| -> Vec<LlamaToken> {
+            let mut p = base.clone();
+            p.extend(std::iter::repeat_n(LlamaToken(persona), persona_len));
+            p.extend(std::iter::repeat_n(LlamaToken(brief), 30));
+            p
+        };
+        let (planner_a, planner_b) = (with(-10, 900, -1), with(-10, 900, -2));
+        let (worker_a, worker_b) = (with(-20, 1400, -1), with(-20, 1400, -2));
+
+        assert_eq!(s.compile_preamble("role:planner", &planner_a), None);
+        assert_eq!(s.compile_preamble("role:worker", &worker_a), None);
+        assert_eq!(s.compile_preamble("role:planner", &planner_b), Some(1500));
+        assert_eq!(s.compile_preamble("role:worker", &worker_b), Some(2000));
+
+        s.observe(&planner_a);
+        s.observe(&worker_b);
+        assert_eq!(
+            s.stable_len(&planner_a),
+            Some(600),
+            "the bucket alone collapses to the shared base, which is why pairs are named"
         );
     }
 

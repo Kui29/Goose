@@ -108,8 +108,8 @@ pub(super) struct GenerationContext<'a> {
     pub prime_waiting: bool,
     /// The waiting turn's cache, set aside while a helper holds the context.
     pub suspended: &'a mut Option<SuspendedKv>,
-    /// A prefill compile (`LocalGenerationRequest::compile_prefill`).
-    pub compile_prefill: bool,
+    /// The shape a prefill compile names (`LocalGenerationRequest::compile_prefill`).
+    pub compile_prefill: Option<String>,
     /// How long a helper snapshot may go unused before a compile discards it.
     pub prefill_retention_secs: Option<u64>,
 }
@@ -1648,6 +1648,8 @@ fn write_snapshot_if_due(
     prompt: &[LlamaToken],
     turn_was_cold: bool,
     class: super::prompt_snapshot::SnapshotClass,
+    // A compile's preamble, which a shared bucket's intersection may have shrunk below.
+    compiled_preamble: Option<usize>,
 ) {
     // Writing is not free: measured 21.2 MiB in 314 ms, about 67 MiB/s, which is
     // ~1.6 s for a 6,000-token preamble on an 18 KiB/token model and ~5 s on a
@@ -1667,7 +1669,7 @@ fn write_snapshot_if_due(
     if kv.head.is_some() {
         return;
     }
-    let Some(keep) = slot.writable_prefix(prompt) else {
+    let Some(keep) = compiled_preamble.or_else(|| slot.writable_prefix(prompt)) else {
         return;
     };
     // The cache has to hold what is about to be written, and there has to be a
@@ -1742,7 +1744,7 @@ fn prefill_prompt(
     helper: bool,
     prime_waiting: bool,
     suspended: &mut Option<SuspendedKv>,
-    compile_prefill: bool,
+    compile_prefill: Option<&str>,
     prefill_retention_secs: Option<u64>,
 ) -> Result<PrefilledPrompt, ProviderError> {
     let n_ctx = u32::try_from(effective_ctx).map_err(|_| {
@@ -1778,18 +1780,34 @@ fn prefill_prompt(
     if let Some(slot) = snapshot.as_mut() {
         slot.observe(prompt);
     }
-    if compile_prefill {
+    // Set when a compile found this shape's snapshot missing or bad: the cold path below writes it.
+    let mut rebuild_preamble: Option<usize> = None;
+    if let Some(shape) = compile_prefill {
         // Judged on the cold path a real turn would take, never on a chat's resident cache.
         *session = None;
         if let Some(slot) = snapshot.as_mut() {
             if let Some(secs) = prefill_retention_secs {
                 slot.retire_idle_helpers(secs);
             }
-            let health = slot.preamble_health(prompt);
+            let preamble = slot.compile_preamble(shape, prompt);
+            let health = match preamble {
+                None => super::prompt_snapshot::PreambleHealth::Unobserved,
+                Some(preamble) => slot.preamble_health_at(prompt, preamble),
+            };
+            if matches!(
+                health,
+                super::prompt_snapshot::PreambleHealth::Missing
+                    | super::prompt_snapshot::PreambleHealth::Stale { .. }
+                    | super::prompt_snapshot::PreambleHealth::Corrupt
+            ) {
+                rebuild_preamble = preamble;
+            }
             tracing::info!(
                 target: "giap::kv",
                 event = "compiled",
+                shape,
                 verdict = ?health,
+                preamble_tokens = preamble.unwrap_or(0),
                 prompt_tokens = prompt.len(),
                 "prefill compile checked this shape's snapshot; a bad one is rebuilt below"
             );
@@ -1857,7 +1875,7 @@ fn prefill_prompt(
             match reuse_prefix(kv, prompt, resume) {
                 Ok(resumed) => {
                     // Warm by definition: this turn reused a prefix.
-                    write_snapshot_if_due(session, snapshot, prompt, false, class);
+                    write_snapshot_if_due(session, snapshot, prompt, false, class, None);
                     return Ok(PrefilledPrompt {
                         reused_prefix_tokens: resumed,
                         transient: None,
@@ -1923,7 +1941,7 @@ fn prefill_prompt(
         Err(e) => return Err(e),
     }
     // Cold: this path decoded the whole prompt.
-    write_snapshot_if_due(session, snapshot, prompt, true, class);
+    write_snapshot_if_due(session, snapshot, prompt, true, class, rebuild_preamble);
     Ok(PrefilledPrompt {
         reused_prefix_tokens: 0,
         transient: None,
@@ -2474,7 +2492,7 @@ pub(super) fn prepare_generation(
             ctx.helper,
             ctx.prime_waiting,
             ctx.suspended,
-            ctx.compile_prefill,
+            ctx.compile_prefill.as_deref(),
             ctx.prefill_retention_secs,
         )?;
         text_breakdown = Some((
@@ -3486,7 +3504,7 @@ pub(super) mod tests {
                 false,
                 false,
                 &mut None,
-                false,
+                None,
                 None,
             )
             .expect("prefill");
@@ -3771,7 +3789,7 @@ pub(super) mod tests {
                     $helper,
                     $prime_waiting,
                     &mut suspended,
-                    false,
+                    None,
                     None,
                 )
                 .expect("prefill")
@@ -3892,8 +3910,8 @@ pub(super) mod tests {
                 .map_or_else(Vec::new, |s| s.snapshot_paths())
         };
 
-        prefill!(&first, true);
-        prefill!(&second, true);
+        prefill!(&first, Some("test-shape"));
+        prefill!(&second, Some("test-shape"));
         let built = files(&snapshot);
         assert_eq!(
             built.len(),
@@ -3903,8 +3921,8 @@ pub(super) mod tests {
         let path = built[0].clone();
         let written_at = std::fs::metadata(&path).unwrap().modified().unwrap();
 
-        prefill!(&first, true);
-        prefill!(&second, true);
+        prefill!(&first, Some("test-shape"));
+        prefill!(&second, Some("test-shape"));
         assert_eq!(
             std::fs::metadata(&path).unwrap().modified().unwrap(),
             written_at,
@@ -3915,8 +3933,8 @@ pub(super) mod tests {
         let middle = bytes.len() / 2;
         bytes[middle] ^= 0xff;
         std::fs::write(&path, &bytes).unwrap();
-        prefill!(&first, true);
-        prefill!(&second, true);
+        prefill!(&first, Some("test-shape"));
+        prefill!(&second, Some("test-shape"));
         let repaired = files(&snapshot);
         assert_eq!(repaired.len(), 1, "a corrupt snapshot must be rebuilt");
         assert_ne!(
@@ -3926,7 +3944,7 @@ pub(super) mod tests {
         );
 
         session = None;
-        let reused = prefill!(&real, false);
+        let reused = prefill!(&real, None);
         assert_eq!(
             reused,
             preamble.len(),

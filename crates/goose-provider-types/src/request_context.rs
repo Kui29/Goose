@@ -7,7 +7,7 @@ tokio::task_local! {
     static TOOL_CALLS_ONLY: bool;
     static HELPER: bool;
     static PRIME_WAITING: bool;
-    static COMPILING_PREFILL: bool;
+    static COMPILING_PREFILL: Option<String>;
     static PREFILL_RETENTION_SECS: Option<u64>;
 }
 
@@ -74,22 +74,27 @@ pub fn prime_is_waiting() -> bool {
     PRIME_WAITING.try_with(|waiting| *waiting).unwrap_or(false)
 }
 
-/// Runs `f` as a prefill compile: the provider prefills cold, checks the preamble snapshot it
-/// would restore against the one two compile calls of this shape share, rebuilds it when it is
-/// missing or bad, and generates at most one token.
-pub async fn compiling_prefill<F: std::future::Future>(f: F) -> F::Output {
-    COMPILING_PREFILL.scope(true, f).await
+/// Runs `f` as a prefill compile of the prompt shape named `shape`: the provider prefills cold,
+/// learns the preamble from what two compile calls of that shape share, keeps a snapshot that
+/// holds exactly it, rebuilds one that is missing or bad, and generates at most one token. The
+/// name, not the prompt, says which calls pair up: many shapes open with the same base prompt.
+pub async fn compiling_prefill<F: std::future::Future>(
+    shape: impl Into<String>,
+    f: F,
+) -> F::Output {
+    COMPILING_PREFILL.scope(Some(shape.into()), f).await
 }
 
 /// [`compiling_prefill`], which also discards helper snapshots unused for longer than
 /// `retention`, so an agent nobody runs stops holding disk.
 pub async fn compiling_prefill_retaining<F: std::future::Future>(
+    shape: impl Into<String>,
     retention: std::time::Duration,
     f: F,
 ) -> F::Output {
     COMPILING_PREFILL
         .scope(
-            true,
+            Some(shape.into()),
             PREFILL_RETENTION_SECS.scope(Some(retention.as_secs()), f),
         )
         .await
@@ -100,11 +105,17 @@ pub fn prefill_retention_secs() -> Option<u64> {
     PREFILL_RETENTION_SECS.try_with(|secs| *secs).ok().flatten()
 }
 
+/// The shape the current [`compiling_prefill`] call compiles; `None` outside one.
+pub fn compiling_prefill_shape() -> Option<String> {
+    COMPILING_PREFILL
+        .try_with(|shape| shape.clone())
+        .ok()
+        .flatten()
+}
+
 /// Whether the current call is [`compiling_prefill`]; `false` outside it.
 pub fn is_compiling_prefill() -> bool {
-    COMPILING_PREFILL
-        .try_with(|compiling| *compiling)
-        .unwrap_or(false)
+    compiling_prefill_shape().is_some()
 }
 
 #[cfg(test)]
@@ -146,17 +157,21 @@ mod tests {
     #[tokio::test]
     async fn only_a_call_made_inside_the_scope_compiles_a_prefill() {
         assert!(!is_compiling_prefill());
-        assert!(compiling_prefill(async { is_compiling_prefill() }).await);
+        assert_eq!(
+            compiling_prefill("role:planner", async { compiling_prefill_shape() }).await,
+            Some("role:planner".to_string())
+        );
         assert!(!is_compiling_prefill(), "the scope ends with its future");
         assert_eq!(
-            compiling_prefill(async { prefill_retention_secs() }).await,
+            compiling_prefill("prime-typed", async { prefill_retention_secs() }).await,
             None,
             "a plain compile discards nothing"
         );
-        let retained = compiling_prefill_retaining(std::time::Duration::from_secs(60), async {
-            (is_compiling_prefill(), prefill_retention_secs())
-        })
-        .await;
+        let retained =
+            compiling_prefill_retaining("role:worker", std::time::Duration::from_secs(60), async {
+                (is_compiling_prefill(), prefill_retention_secs())
+            })
+            .await;
         assert_eq!(retained, (true, Some(60)));
         assert_eq!(prefill_retention_secs(), None);
     }
